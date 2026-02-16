@@ -129,8 +129,7 @@ HTML = r"""
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Evaluación de Calidad – Dashboard</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.7/chart.umd.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.7/chart.umd.min.js"></script> <script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-datalabels/2.2.0/chartjs-plugin-datalabels.min.js"></script> <script> if (window.Chart && window.ChartDataLabels) { Chart.register(ChartDataLabels); } </script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
@@ -656,7 +655,6 @@ function buildCard(q, idx) {
           hoverBackgroundColor: colors.bg,
         }]
       },
-      plugins: [ChartDataLabels],
       options: {
         responsive: true,
         maintainAspectRatio: true,
