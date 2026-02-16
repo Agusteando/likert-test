@@ -5,8 +5,11 @@ Evaluación de Calidad – Dashboard (Flask for Vercel)
 Update:
 - Data source can be a Google Apps Script exec endpoint (Google Sheets -> JSON).
 - Keeps Vercel-safe /api/data?id=### (numeric plantel_id).
-- Adds a reload endpoint /api/reload to clear cache and refresh data.
-- Fixes chart type switching robustness (avoids late chart renders when switching quickly).
+- Adds /api/reload to clear cache and refresh data.
+- Adds /api/likert_compare to compare Likert distribution across planteles.
+- UI: preserves everything, and adds ONE additional visualization: a 100% stacked horizontal bar chart
+  (Likert distribution per plantel) with "FOCO ROJO" highlighting.
+- Fixes chart type switching robustness for per-question charts.
 """
 
 import os
@@ -23,7 +26,7 @@ from flask import Flask, jsonify, render_template_string, request
 # ── Config ──────────────────────────────────────────────────────────────────
 EXCEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset.xlsx")
 
-DATA_ENDPOINT_URL = os.environ.get("DATA_ENDPOINT_URL", "https://script.google.com/macros/s/AKfycbyWSeFiAu3DnCYanPMdOUuNj6YvEYw7-1VMbRJu6MmmJL1vXE7oLGFS83Tg5gmGVnulHA/exec").strip()
+DATA_ENDPOINT_URL = os.environ.get("DATA_ENDPOINT_URL", "").strip()
 DATA_ENDPOINT_API_KEY = os.environ.get("DATA_ENDPOINT_API_KEY", "").strip()
 DATA_CACHE_TTL_SECONDS = int(os.environ.get("DATA_CACHE_TTL_SECONDS", "300"))
 
@@ -65,11 +68,9 @@ def _build_endpoint_url(base_url: str) -> str:
     parsed = urllib.parse.urlparse(base_url)
     q = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
 
-    # Enforce mode=records (unless user already set a mode)
     if "mode" not in q:
         q["mode"] = ["records"]
 
-    # Optional key
     if DATA_ENDPOINT_API_KEY and "key" not in q:
         q["key"] = [DATA_ENDPOINT_API_KEY]
 
@@ -99,11 +100,9 @@ def load_data_from_endpoint() -> pd.DataFrame:
     url = _build_endpoint_url(DATA_ENDPOINT_URL)
     payload = _http_get_json(url)
 
-    # Accept multiple shapes for flexibility
     records: Optional[List[Dict[str, Any]]] = None
 
     if isinstance(payload, list):
-        # list of dicts
         records = payload if payload and isinstance(payload[0], dict) else []
     elif isinstance(payload, dict):
         if payload.get("ok") is False:
@@ -118,8 +117,9 @@ def load_data_from_endpoint() -> pd.DataFrame:
             df = pd.DataFrame(rows, columns=cols)
             return _normalize_df_strings(df)
         else:
-            # If dict but unknown structure, try to interpret as records if values look like rows
-            raise RuntimeError("Endpoint JSON structure not recognized. Expected {records:[...]} or list of objects.")
+            raise RuntimeError(
+                "Endpoint JSON structure not recognized. Expected {records:[...]} or list of objects."
+            )
     else:
         raise RuntimeError("Endpoint did not return valid JSON (dict or list).")
 
@@ -137,7 +137,6 @@ def load_data_from_excel() -> pd.DataFrame:
 
 
 def classify_and_prepare(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], List[str]]:
-    # Normalize Likert values (fix casing inconsistencies)
     likert_map = {
         "muy satisfecho": "Muy satisfecho",
         "satisfecho": "Satisfecho",
@@ -146,7 +145,6 @@ def classify_and_prepare(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Lis
         "muy insatisfecho": "Muy insatisfecho",
     }
 
-    # Identify question columns (skip metadata, open-text, and null columns)
     skip_keywords = [
         "marca temporal",
         "nombre del alumno",
@@ -168,7 +166,6 @@ def classify_and_prepare(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Lis
         if len(vals) <= 10:
             question_cols.append(c)
 
-    # Classify questions
     likert5_cols: List[str] = []
     yesno_cols: List[str] = []
 
@@ -185,14 +182,14 @@ def classify_and_prepare(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Lis
             yesno_cols.append(c)
             df[c] = df[c].apply(
                 lambda x: (
-                    "Sí" if str(x).strip().lower() in {"sí", "si"}
+                    "Sí"
+                    if str(x).strip().lower() in {"sí", "si"}
                     else ("No" if str(x).strip().lower() == "no" else x)
                 )
                 if pd.notna(x)
                 else x
             )
 
-    # Build plantel column: "Nivel Educativo – Campus"
     if "Nivel Educativo" in df.columns and "Campus" in df.columns:
         ne = _clean_text_series(df["Nivel Educativo"])
         ca = _clean_text_series(df["Campus"])
@@ -200,24 +197,18 @@ def classify_and_prepare(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Lis
     else:
         df["plantel"] = "Plantel"
 
-    # Clean plantel itself (extra safety)
     df["plantel"] = _clean_text_series(df["plantel"])
-
     return df, likert5_cols, yesno_cols
 
 
 def load_data() -> Tuple[pd.DataFrame, List[str], List[str], str]:
-    """
-    Returns df, likert5_cols, yesno_cols, source_label
-    """
     if DATA_ENDPOINT_URL:
         df = load_data_from_endpoint()
         df, likert5_cols, yesno_cols = classify_and_prepare(df)
         return df, likert5_cols, yesno_cols, "endpoint"
-    else:
-        df = load_data_from_excel()
-        df, likert5_cols, yesno_cols = classify_and_prepare(df)
-        return df, likert5_cols, yesno_cols, "excel"
+    df = load_data_from_excel()
+    df, likert5_cols, yesno_cols = classify_and_prepare(df)
+    return df, likert5_cols, yesno_cols, "excel"
 
 
 def clear_cache():
@@ -238,8 +229,7 @@ def ensure_loaded(force: bool = False):
     if not force and _df is not None and _loaded_at_epoch is not None:
         if DATA_CACHE_TTL_SECONDS <= 0:
             return
-        age = now - _loaded_at_epoch
-        if age < DATA_CACHE_TTL_SECONDS:
+        if (now - _loaded_at_epoch) < DATA_CACHE_TTL_SECONDS:
             return
 
     df, likert5_cols, yesno_cols, source_label = load_data()
@@ -260,7 +250,6 @@ def compute_results(sub_df: pd.DataFrame):
     total = int(len(sub_df))
     results = []
 
-    # Defensive: if columns were not set for some reason
     if not _all_question_cols or not _likert5_cols or not _yesno_cols:
         return []
 
@@ -290,6 +279,97 @@ def compute_results(sub_df: pd.DataFrame):
         )
 
     return results
+
+
+def compute_likert_compare(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Returns ONE visualization payload: 100% stacked Likert distribution by plantel.
+
+    We aggregate all Likert answers for each plantel across all Likert questions.
+    """
+    if not _plantel_names:
+        return {
+            "ok": True,
+            "order": LIKERT5_ORDER,
+            "planteles": [],
+            "respondents": [],
+            "likert_answers": [],
+            "pct_by_label": {k: [] for k in LIKERT5_ORDER},
+            "negative_pct": [],
+            "positive_pct": [],
+            "foco_red": [],
+        }
+
+    if not _likert5_cols:
+        return {
+            "ok": True,
+            "order": LIKERT5_ORDER,
+            "planteles": _plantel_names,
+            "respondents": [int(len(df[df["plantel"] == p])) for p in _plantel_names],
+            "likert_answers": [0 for _ in _plantel_names],
+            "pct_by_label": {k: [0 for _ in _plantel_names] for k in LIKERT5_ORDER},
+            "negative_pct": [0 for _ in _plantel_names],
+            "positive_pct": [0 for _ in _plantel_names],
+            "foco_red": [False for _ in _plantel_names],
+        }
+
+    rows: List[Dict[str, Any]] = []
+    for plantel in _plantel_names:
+        sub = df[df["plantel"] == plantel] if "plantel" in df.columns else pd.DataFrame()
+        respondents = int(len(sub))
+
+        if respondents == 0:
+            counts_map = {k: 0 for k in LIKERT5_ORDER}
+            likert_answers = 0
+        else:
+            cols_present = [c for c in _likert5_cols if c in sub.columns]
+            if not cols_present:
+                counts_map = {k: 0 for k in LIKERT5_ORDER}
+                likert_answers = 0
+            else:
+                vals = pd.Series(sub[cols_present].to_numpy().ravel()).dropna()
+                vc = vals.value_counts()
+                counts_map = {k: int(vc.get(k, 0)) for k in LIKERT5_ORDER}
+                likert_answers = int(sum(counts_map.values()))
+
+        pct_map = {}
+        for k in LIKERT5_ORDER:
+            pct_map[k] = round((counts_map[k] / likert_answers * 100), 1) if likert_answers > 0 else 0.0
+
+        negative_pct = round(pct_map["Insatisfecho"] + pct_map["Muy insatisfecho"], 1)
+        positive_pct = round(pct_map["Muy satisfecho"] + pct_map["Satisfecho"], 1)
+
+        rows.append(
+            {
+                "plantel": plantel,
+                "respondents": respondents,
+                "likert_answers": likert_answers,
+                "pct": pct_map,
+                "negative_pct": negative_pct,
+                "positive_pct": positive_pct,
+            }
+        )
+
+    # Sort for "foco rojo": highest negative first; tie-breakers by respondents, then plantel name
+    rows.sort(key=lambda r: (-r["negative_pct"], -r["respondents"], str(r["plantel"])))
+
+    # Mark top K as foco rojo (only if they have likert answers)
+    K = 3
+    eligible = [i for i, r in enumerate(rows) if r["likert_answers"] > 0]
+    foco_idx = set(eligible[:K])
+
+    payload = {
+        "ok": True,
+        "order": LIKERT5_ORDER,
+        "planteles": [r["plantel"] for r in rows],
+        "respondents": [r["respondents"] for r in rows],
+        "likert_answers": [r["likert_answers"] for r in rows],
+        "pct_by_label": {k: [r["pct"][k] for r in rows] for k in LIKERT5_ORDER},
+        "negative_pct": [r["negative_pct"] for r in rows],
+        "positive_pct": [r["positive_pct"] for r in rows],
+        "foco_red": [i in foco_idx for i in range(len(rows))],
+    }
+    return payload
 
 
 # ── Flask app ───────────────────────────────────────────────────────────────
@@ -350,7 +430,6 @@ def api_reload():
 
 @app.route("/api/planteles")
 def api_planteles():
-    # Keep EXACTLY the old behavior: list of strings.
     try:
         ensure_loaded()
         return jsonify(_plantel_names or [])
@@ -396,6 +475,16 @@ def api_data_all():
         return jsonify(compute_results(_df if _df is not None else pd.DataFrame()))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/likert_compare")
+def api_likert_compare():
+    try:
+        ensure_loaded()
+        df = _df if _df is not None else pd.DataFrame()
+        return jsonify(compute_likert_compare(df))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # Legacy route (kept, but UI no longer uses it)
@@ -544,7 +633,7 @@ HTML = r"""
 
   .stats-row {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 16px; margin-bottom: 36px;
+    gap: 16px; margin-bottom: 24px;
   }
   .stat-card {
     background: var(--surface); border-radius: var(--radius);
@@ -577,6 +666,32 @@ HTML = r"""
   .chart-card h3 { font-size: 0.88rem; font-weight: 600; line-height: 1.45; margin-bottom: 18px; color: var(--text); }
   .chart-card .chart-wrap { position: relative; width: 100%; min-height: 250px; }
   .chart-card canvas { width: 100% !important; }
+
+  .compare-wrap { position: relative; width: 100%; min-height: 520px; }
+  .compare-note {
+    margin-top: 10px;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    line-height: 1.35;
+  }
+  .compare-badges {
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+    margin-top: 10px;
+  }
+  .mini-badge {
+    display:inline-flex;
+    align-items:center;
+    gap:8px;
+    padding: 8px 10px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: #fff;
+    font-size: 0.78rem;
+    color: var(--text);
+  }
+  .mini-dot { width:10px; height:10px; border-radius: 3px; }
 
   .chart-card .summary-bar { display: flex; margin-top: 14px; border-radius: 8px; overflow: hidden; height: 10px; }
   .chart-card .detail-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
@@ -671,6 +786,10 @@ HTML = r"""
 
   <div id="clientError" class="error-banner" style="display:none;"></div>
   <div class="stats-row" id="statsRow"></div>
+
+  <!-- NEW: single cross-plantel Likert visualization (keeps everything else intact) -->
+  <div id="compareContainer"></div>
+
   <div id="sectionsContainer"></div>
 </div>
 
@@ -766,6 +885,15 @@ HTML = r"""
       el.textContent = msg;
     }
 
+    function hexToRgba(hex, alpha) {
+      const h = (hex || '').replace('#','').trim();
+      if (h.length !== 6) return `rgba(148,163,184,${alpha})`;
+      const r = parseInt(h.slice(0,2), 16);
+      const g = parseInt(h.slice(2,4), 16);
+      const b = parseInt(h.slice(4,6), 16);
+      return `rgba(${r},${g},${b},${alpha})`;
+    }
+
     window.handlePrint = function handlePrint() {
       setTimeout(() => window.print(), 300);
     };
@@ -775,7 +903,7 @@ HTML = r"""
       try {
         await fetch('/api/reload', { method: 'POST', cache: 'no-store' });
       } catch (e) {
-        // If reload fails, still refresh the page
+        // ignore
       } finally {
         location.reload();
       }
@@ -800,6 +928,92 @@ HTML = r"""
 
     // Render sequence token to avoid late chart creation when switching chart types quickly
     let renderSeq = 0;
+
+    // NEW compare chart state
+    let comparePayload = null;
+    let compareChart = null;
+    let selectedPlantelName = null;
+
+    // Plugins for compare chart
+    const focoRedPlugin = {
+      id: 'focoRedPlugin',
+      afterDatasetsDraw(chart, args, pluginOptions) {
+        try {
+          const opts = pluginOptions || {};
+          const focoFlags = opts.focoFlags || [];
+          const negPcts = opts.negativePct || [];
+          const planteles = opts.planteles || [];
+          const area = chart.chartArea;
+          if (!area) return;
+
+          const ctx = chart.ctx;
+          ctx.save();
+
+          const yScale = chart.scales && chart.scales.y;
+          if (!yScale) { ctx.restore(); return; }
+
+          // Draw faint red band behind FOCO ROJO bars + label at right
+          for (let i = 0; i < planteles.length; i++) {
+            if (!focoFlags[i]) continue;
+
+            const y = yScale.getPixelForValue(i);
+            const bandH = Math.max(18, yScale.getPixelForTick(i + 1) - yScale.getPixelForTick(i) - 6);
+            const top = y - bandH / 2;
+
+            ctx.fillStyle = 'rgba(239,68,68,0.10)'; // subtle red background
+            ctx.fillRect(area.left, top, area.right - area.left, bandH);
+
+            ctx.strokeStyle = 'rgba(239,68,68,0.55)';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(area.left + 1, top + 1, (area.right - area.left) - 2, bandH - 2);
+
+            const label = `FOCO ROJO · ${negPcts[i] || 0}% neg.`;
+            ctx.font = '700 12px Inter, system-ui, -apple-system, sans-serif';
+            ctx.fillStyle = 'rgba(127,29,29,0.95)';
+            ctx.textAlign = 'right';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(label, area.right - 6, y);
+          }
+
+          ctx.restore();
+        } catch (e) {
+          // no-op
+        }
+      }
+    };
+
+    const selectionHighlightPlugin = {
+      id: 'selectionHighlightPlugin',
+      afterDatasetsDraw(chart, args, pluginOptions) {
+        try {
+          const opts = pluginOptions || {};
+          const selectedIndex = opts.selectedIndex;
+          if (selectedIndex === null || selectedIndex === undefined || selectedIndex < 0) return;
+
+          const area = chart.chartArea;
+          if (!area) return;
+
+          const yScale = chart.scales && chart.scales.y;
+          if (!yScale) return;
+
+          const ctx = chart.ctx;
+          ctx.save();
+
+          const y = yScale.getPixelForValue(selectedIndex);
+          const bandH = Math.max(20, yScale.getPixelForTick(selectedIndex + 1) - yScale.getPixelForTick(selectedIndex) - 4);
+          const top = y - bandH / 2;
+
+          ctx.strokeStyle = 'rgba(99,102,241,0.9)'; // accent
+          ctx.lineWidth = 3;
+          ctx.setLineDash([6, 4]);
+          ctx.strokeRect(area.left + 2, top + 2, (area.right - area.left) - 4, bandH - 4);
+
+          ctx.restore();
+        } catch (e) {
+          // no-op
+        }
+      }
+    };
 
     async function startApp() {
       try {
@@ -848,6 +1062,11 @@ HTML = r"""
         });
 
         updateLegend('likert5');
+
+        // NEW: load compare payload once
+        await loadLikertCompare();
+
+        // Load initial view
         await loadPlantel(sel.value);
       } catch (e) {
         console.error(e);
@@ -862,6 +1081,220 @@ HTML = r"""
       startApp();
     }
 
+    async function loadLikertCompare() {
+      const res = await fetch('/api/likert_compare', { cache: 'no-store' });
+      const payload = await res.json();
+      if (!res.ok || payload?.ok === false || payload?.error) {
+        throw new Error(payload?.error || 'Error cargando /api/likert_compare');
+      }
+      comparePayload = payload;
+      renderCompareChart(); // initial render (no selection yet)
+    }
+
+    function ensureCompareContainer() {
+      const c = document.getElementById('compareContainer');
+      if (!c) return null;
+
+      if (!comparePayload || !Array.isArray(comparePayload.planteles) || comparePayload.planteles.length === 0) {
+        c.innerHTML = '';
+        return null;
+      }
+
+      if (!document.getElementById('compareChart')) {
+        c.innerHTML = `
+          <div class="section-label">Comparativo de satisfacción por plantel (Likert)</div>
+          <div class="chart-card">
+            <h3>Distribución Likert agregada por plantel (100% apilada) · Ordenado por “foco rojo” (más negativo → menos)</h3>
+            <div class="compare-wrap">
+              <canvas id="compareChart"></canvas>
+            </div>
+            <div class="compare-note">
+              La barra de cada plantel representa el 100% de sus respuestas Likert (sumando todas las preguntas Likert).
+              Se resalta como <strong>FOCO ROJO</strong> el Top 3 por porcentaje negativo (Insatisfecho + Muy insatisfecho).
+            </div>
+            <div class="compare-badges" id="compareBadges"></div>
+          </div>
+        `;
+      }
+
+      return document.getElementById('compareChart');
+    }
+
+    function renderCompareBadges() {
+      const wrap = document.getElementById('compareBadges');
+      if (!wrap || !comparePayload) return;
+
+      const focoFlags = comparePayload.foco_red || [];
+      const planteles = comparePayload.planteles || [];
+      const neg = comparePayload.negative_pct || [];
+      const pos = comparePayload.positive_pct || [];
+      const respondents = comparePayload.respondents || [];
+
+      const foco = [];
+      for (let i = 0; i < planteles.length; i++) {
+        if (focoFlags[i]) foco.push(i);
+      }
+
+      wrap.innerHTML = '';
+
+      const makeBadge = (title, dotColor, text) => {
+        const el = document.createElement('div');
+        el.className = 'mini-badge';
+        el.innerHTML = `<span class="mini-dot" style="background:${dotColor}"></span><span><strong>${title}</strong> ${text}</span>`;
+        wrap.appendChild(el);
+      };
+
+      // Selected
+      if (selectedPlantelName) {
+        makeBadge('Seleccionado', '#6366f1', selectedPlantelName);
+      } else {
+        makeBadge('Vista', '#6366f1', 'Comparativo general');
+      }
+
+      // Foco rojo summary
+      if (foco.length) {
+        const top = foco.map(i => `${planteles[i]} (${neg[i]}% neg., ${pos[i]}% pos., ${respondents[i]} resp.)`);
+        makeBadge('Foco rojo', '#ef4444', top.join(' · '));
+      } else {
+        makeBadge('Foco rojo', '#ef4444', 'No disponible (sin datos Likert)');
+      }
+    }
+
+    function renderCompareChart() {
+      const canvas = ensureCompareContainer();
+      if (!canvas || !comparePayload) return;
+
+      const planteles = comparePayload.planteles || [];
+      const order = comparePayload.order || [];
+      const pctByLabel = comparePayload.pct_by_label || {};
+      const focoFlags = comparePayload.foco_red || [];
+      const negPct = comparePayload.negative_pct || [];
+      const posPct = comparePayload.positive_pct || [];
+      const respondents = comparePayload.respondents || [];
+      const likertAnswers = comparePayload.likert_answers || [];
+
+      // Find selected plantel index (in the compare chart order)
+      let selectedIndex = -1;
+      if (selectedPlantelName) {
+        selectedIndex = planteles.findIndex(p => p === selectedPlantelName);
+      }
+
+      // Build datasets in Likert order (green->red; heavy color)
+      const datasets = order.map(label => {
+        const c = LIKERT5_COLORS[label] || { bg: '#cbd5e1', border: '#94a3b8' };
+        return {
+          label,
+          data: (pctByLabel[label] || []).map(x => Number(x || 0)),
+          backgroundColor: hexToRgba(c.bg, 0.90),
+          borderColor: c.border,
+          borderWidth: 1,
+          stack: 'likert',
+          barPercentage: 0.72,
+          categoryPercentage: 0.84,
+        };
+      });
+
+      // Destroy existing
+      if (compareChart) {
+        try { compareChart.destroy(); } catch (e) {}
+        compareChart = null;
+      }
+      const existing = window.Chart.getChart(canvas);
+      if (existing) existing.destroy();
+
+      compareChart = new window.Chart(canvas.getContext('2d'), {
+        type: 'bar',
+        data: {
+          labels: planteles,
+          datasets
+        },
+        plugins: [focoRedPlugin, selectionHighlightPlugin],
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          indexAxis: 'y',
+          layout: { padding: { top: 8, right: 10, left: 6, bottom: 4 } },
+          plugins: {
+            legend: {
+              display: true,
+              position: 'bottom',
+              labels: {
+                boxWidth: 14,
+                boxHeight: 14,
+                color: '#475569',
+                font: { family: 'Inter', weight: '600', size: 11 }
+              }
+            },
+            tooltip: {
+              backgroundColor: '#1e293b',
+              cornerRadius: 10,
+              padding: 12,
+              callbacks: {
+                title: items => {
+                  const idx = items && items.length ? items[0].dataIndex : -1;
+                  if (idx < 0) return '';
+                  const tag = focoFlags[idx] ? ' · FOCO ROJO' : '';
+                  return `${planteles[idx]}${tag}`;
+                },
+                label: ctx => {
+                  const v = ctx.raw || 0;
+                  return `${ctx.dataset.label}: ${v}%`;
+                },
+                afterBody: items => {
+                  const idx = items && items.length ? items[0].dataIndex : -1;
+                  if (idx < 0) return '';
+                  return [
+                    `Positivo (MS+S): ${posPct[idx] || 0}%`,
+                    `Negativo (I+MI): ${negPct[idx] || 0}%`,
+                    `Respuestas (encuestas): ${respondents[idx] || 0}`,
+                    `Respuestas Likert (sumadas): ${likertAnswers[idx] || 0}`,
+                  ];
+                }
+              }
+            },
+            datalabels: { display: false }, // keep it readable (tooltip carries detail)
+            focoRedPlugin: {
+              focoFlags: focoFlags,
+              negativePct: negPct,
+              planteles: planteles
+            },
+            selectionHighlightPlugin: {
+              selectedIndex: selectedIndex
+            }
+          },
+          scales: {
+            x: {
+              stacked: true,
+              min: 0,
+              max: 100,
+              grid: { color: '#eef2f7' },
+              ticks: {
+                color: '#64748b',
+                callback: v => `${v}%`
+              }
+            },
+            y: {
+              stacked: true,
+              grid: { display: false },
+              ticks: {
+                color: '#334155',
+                font: { family: 'Inter', weight: '600', size: 11 },
+                callback: (value, index) => {
+                  const label = planteles[index] || '';
+                  const rank = (index + 1);
+                  const star = (index === selectedIndex) ? '★ ' : '';
+                  return `${rank}. ${star}${label}`;
+                }
+              }
+            }
+          },
+          animation: { duration: 650 }
+        }
+      });
+
+      renderCompareBadges();
+    }
+
     async function loadPlantel(value) {
       showLoader(true);
       try {
@@ -874,8 +1307,10 @@ HTML = r"""
         if (value === '__ALL__') {
           url = '/api/data_all';
           displayName = 'Todos los Planteles';
+          selectedPlantelName = null;
         } else {
           url = `/api/data?id=${encodeURIComponent(value)}`;
+          selectedPlantelName = displayName;
         }
 
         const res = await fetch(url, { cache: 'no-store' });
@@ -890,6 +1325,9 @@ HTML = r"""
         document.getElementById('titlePlantel').textContent = displayName;
         const total = currentData.length > 0 ? currentData[0].total : 0;
         document.getElementById('badgeN').textContent = `${total} respuestas`;
+
+        // NEW: re-render compare chart to reflect selected highlight
+        renderCompareChart();
 
         renderStats();
         renderCharts();
@@ -975,15 +1413,6 @@ HTML = r"""
       }
     }
 
-    function hexToRgba(hex, alpha) {
-      const h = (hex || '').replace('#','').trim();
-      if (h.length !== 6) return `rgba(148,163,184,${alpha})`;
-      const r = parseInt(h.slice(0,2), 16);
-      const g = parseInt(h.slice(2,4), 16);
-      const b = parseInt(h.slice(4,6), 16);
-      return `rgba(${r},${g},${b},${alpha})`;
-    }
-
     function buildCard(q, idx, seq) {
       const card = document.createElement('div');
       card.className = 'chart-card';
@@ -1028,7 +1457,6 @@ HTML = r"""
       card.appendChild(wrap);
 
       requestAnimationFrame(() => {
-        // If a newer render started, abort creating this chart
         if (seq !== renderSeq) return;
         if (!canvas.isConnected) return;
         if (!window.Chart) return;
@@ -1036,17 +1464,14 @@ HTML = r"""
         const originalType = currentChartType;
         const isCartesian = ['bar', 'horizontalBar'].includes(originalType);
         const isRadar = originalType === 'radar';
-
         const chartType = (originalType === 'horizontalBar') ? 'bar' : originalType;
 
-        // Destroy any existing chart bound to this canvas (safety)
         const existing = window.Chart.getChart(canvas);
         if (existing) existing.destroy();
 
         let dataset;
 
         if (chartType === 'radar') {
-          // Radar works better with a single fill color + per-point colors
           dataset = {
             data: counts,
             backgroundColor: hexToRgba(colors.bg[0] || '#cbd5e1', 0.25),
@@ -1068,7 +1493,6 @@ HTML = r"""
             hoverBackgroundColor: colors.bg,
           };
         } else {
-          // pie/doughnut/polarArea
           dataset = {
             data: counts,
             backgroundColor: colors.bg.map(c => c + 'cc'),
