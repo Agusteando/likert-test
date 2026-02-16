@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Evaluación de Calidad – Dashboard Generator
-Launches a web UI to visualize Likert-scale survey results per plantel.
+Web UI to visualize Likert-scale survey results per plantel.
 """
 
 import os
@@ -25,7 +25,6 @@ _planteles = None
 def load_data():
     df = pd.read_excel(EXCEL_PATH)
 
-    # Normalize Likert values (fix casing inconsistencies)
     likert_map = {
         "muy satisfecho": "Muy satisfecho",
         "satisfecho": "Satisfecho",
@@ -34,7 +33,6 @@ def load_data():
         "muy insatisfecho": "Muy insatisfecho",
     }
 
-    # Identify question columns (skip metadata, open-text, and null columns)
     skip_keywords = [
         "marca temporal",
         "nombre del alumno",
@@ -56,31 +54,30 @@ def load_data():
         if len(vals) <= 10:
             question_cols.append(c)
 
-    # Classify questions
-    likert5_cols = []  # 5-point satisfaction scale
-    yesno_cols = []  # Sí/No questions
+    likert5_cols = []
+    yesno_cols = []
 
     for c in question_cols:
         vals = set(str(v).strip().lower() for v in df[c].dropna().unique())
+
         if vals <= {"muy satisfecho", "satisfecho", "neutral", "insatisfecho", "muy insatisfecho"}:
             likert5_cols.append(c)
             df[c] = df[c].apply(
                 lambda x: likert_map.get(str(x).strip().lower(), x) if pd.notna(x) else x
             )
+
         elif vals <= {"sí", "si", "no"}:
             yesno_cols.append(c)
-            # normalize Sí/Si variants
             df[c] = df[c].apply(
-                lambda x: "Sí" if str(x).strip().lower() in {"sí", "si"} else ("No" if str(x).strip().lower() == "no" else x)
-                if pd.notna(x)
-                else x
+                lambda x: (
+                    "Sí" if str(x).strip().lower() in {"sí", "si"}
+                    else ("No" if str(x).strip().lower() == "no" else x)
+                ) if pd.notna(x) else x
             )
 
-    # Build plantel column: "Nivel Educativo – Campus"
     if "Nivel Educativo" in df.columns and "Campus" in df.columns:
         df["plantel"] = df["Nivel Educativo"].astype(str).str.strip() + " – " + df["Campus"].astype(str).str.strip()
     else:
-        # Fallback if columns differ
         df["plantel"] = "Plantel"
 
     return df, likert5_cols, yesno_cols
@@ -149,7 +146,6 @@ def api_data(plantel):
 
 @app.route("/api/data_all")
 def api_data_all():
-    """Return aggregated data across ALL planteles (global view)."""
     try:
         ensure_loaded()
         total = int(len(_df))
@@ -195,7 +191,6 @@ HTML = r"""
     --bg:        #f4f6f9;
     --surface:   #ffffff;
     --sidebar:   #1e293b;
-    --sidebar-active: #334155;
     --accent:    #6366f1;
     --accent-light: #818cf8;
     --text:      #1e293b;
@@ -203,14 +198,12 @@ HTML = r"""
     --border:    #e2e8f0;
     --radius:    16px;
 
-    /* Likert 5-pt pastel palette (green→red) */
-    --l5-1: #4ade80; /* Muy satisfecho  – vivid green */
-    --l5-2: #86efac; /* Satisfecho       – light green */
-    --l5-3: #fde047; /* Neutral           – warm yellow */
-    --l5-4: #fca5a5; /* Insatisfecho      – light red */
-    --l5-5: #f87171; /* Muy insatisfecho  – vivid red */
+    --l5-1: #4ade80;
+    --l5-2: #86efac;
+    --l5-3: #fde047;
+    --l5-4: #fca5a5;
+    --l5-5: #f87171;
 
-    /* Yes/No */
     --yn-yes: #4ade80;
     --yn-no:  #f87171;
   }
@@ -225,7 +218,6 @@ HTML = r"""
     min-height: 100vh;
   }
 
-  /* ── Sidebar ── */
   .sidebar {
     position: fixed; top:0; left:0; bottom:0;
     width: 310px;
@@ -268,7 +260,6 @@ HTML = r"""
     background: var(--accent) !important;
     border-color: var(--accent) !important;
     font-weight: 600;
-    letter-spacing: 0.01em;
   }
   .btn-primary:hover { background: var(--accent-light) !important; }
   .btn-outline {
@@ -295,7 +286,6 @@ HTML = r"""
   .chart-type-grid button {
     padding: 7px 8px; font-size: 0.78rem; border-radius: 8px;
     background: #334155; border: 1px solid #475569; color: #cbd5e1;
-    cursor: pointer; transition: all .15s;
   }
   .chart-type-grid button.active,
   .chart-type-grid button:hover {
@@ -313,7 +303,6 @@ HTML = r"""
     width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0;
   }
 
-  /* ── Main content ── */
   .main {
     margin-left: 310px;
     flex: 1;
@@ -325,7 +314,7 @@ HTML = r"""
     margin-bottom: 36px;
   }
   .header-bar h2 {
-    font-size: 1.6rem; font-weight: 700; letter-spacing: -0.02em;
+    font-size: 1.6rem; font-weight: 700;
   }
   .header-bar .badge {
     background: var(--accent); color: #fff;
@@ -343,7 +332,7 @@ HTML = r"""
     box-shadow: 0 1px 3px rgba(0,0,0,.06);
   }
   .stat-card .stat-label { font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
-  .stat-card .stat-value { font-size: 1.8rem; font-weight: 800; margin-top: 4px; letter-spacing: -0.03em; }
+  .stat-card .stat-value { font-size: 1.8rem; font-weight: 800; margin-top: 4px; }
 
   .section-label {
     font-size: 0.75rem; text-transform: uppercase; letter-spacing: .08em;
@@ -364,9 +353,7 @@ HTML = r"""
     padding: 28px;
     box-shadow: 0 1px 4px rgba(0,0,0,.05);
     break-inside: avoid;
-    transition: box-shadow .2s;
   }
-  .chart-card:hover { box-shadow: 0 6px 20px rgba(0,0,0,.08); }
   .chart-card h3 {
     font-size: 0.88rem; font-weight: 600; line-height: 1.45;
     margin-bottom: 18px; color: var(--text);
@@ -379,7 +366,6 @@ HTML = r"""
   .chart-card .summary-bar {
     display: flex; margin-top: 14px; border-radius: 8px; overflow: hidden; height: 10px;
   }
-  .chart-card .summary-bar div { transition: width .4s ease; }
 
   .chart-card .detail-row {
     display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px;
@@ -390,7 +376,6 @@ HTML = r"""
   }
   .detail-pill .dot { width: 8px; height: 8px; border-radius: 2px; }
 
-  /* ── Loading ── */
   .loading-overlay {
     position: fixed; top:0;left:0;right:0;bottom:0;
     background: rgba(244,246,249,.85);
@@ -418,23 +403,17 @@ HTML = r"""
     line-height: 1.35;
   }
 
-  /* ── Print ── */
   @media print {
     body { background: #fff; }
     .sidebar { display: none !important; }
     .main { margin-left: 0; padding: 20px; }
     .chart-card { break-inside: avoid; box-shadow: none; border: 1px solid #e2e8f0; }
     .charts-grid { grid-template-columns: 1fr 1fr; gap: 16px; }
-    .header-bar .badge { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
-    .summary-bar div, .legend-dot, .detail-pill .dot, .stat-card {
-      print-color-adjust: exact; -webkit-print-color-adjust: exact;
-    }
   }
 </style>
 </head>
 <body>
 
-<!-- Sidebar -->
 <aside class="sidebar">
   <div>
     <h1>📊 Evaluación de <span>Calidad</span> del Servicio</h1>
@@ -484,7 +463,6 @@ HTML = r"""
   </div>
 </aside>
 
-<!-- Main -->
 <div class="main" id="mainContent">
   <div class="loading-overlay" id="loader"><div class="spinner"></div></div>
 
@@ -496,18 +474,15 @@ HTML = r"""
   <div id="clientError" class="error-banner" style="display:none;"></div>
 
   <div class="stats-row" id="statsRow"></div>
-
   <div id="sectionsContainer"></div>
 </div>
 
 <script>
 /*
-  Fixes both errors you reported:
-  - "Chart is not defined"
-  - chartjs-plugin-datalabels trying to access Chart before Chart exists
-
-  We load Chart.js first (with fallback CDNs), then load chartjs-plugin-datalabels,
-  then register the plugin, THEN start the dashboard code.
+  IMPORTANT FIX for "stuck on Loading" in Vercel:
+  We load Chart.js + DataLabels asynchronously. That can complete AFTER DOMContentLoaded.
+  If your app only starts inside a DOMContentLoaded listener, it may never run.
+  So we start immediately if the DOM is already ready.
 */
 (function () {
   function showClientError(msg) {
@@ -515,6 +490,12 @@ HTML = r"""
     if (!el) return;
     el.style.display = 'block';
     el.textContent = msg;
+  }
+
+  function showLoader(show) {
+    const loader = document.getElementById('loader');
+    if (!loader) return;
+    loader.classList.toggle('hidden', !show);
   }
 
   function loadScript(src) {
@@ -542,7 +523,8 @@ HTML = r"""
   }
 
   async function boot() {
-    // 1) Load Chart.js (UMD build so window.Chart exists)
+    showLoader(true);
+
     await loadFirstAvailable([
       'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js',
       'https://unpkg.com/chart.js@4.4.1/dist/chart.umd.min.js'
@@ -552,7 +534,6 @@ HTML = r"""
       throw new Error('Chart.js loaded but window.Chart is missing.');
     }
 
-    // 2) Load datalabels plugin (UMD build)
     await loadFirstAvailable([
       'https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js',
       'https://unpkg.com/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js'
@@ -562,30 +543,25 @@ HTML = r"""
       throw new Error('chartjs-plugin-datalabels loaded but window.ChartDataLabels is missing.');
     }
 
-    // 3) Register plugin ONCE globally
     window.Chart.register(window.ChartDataLabels);
 
-    // 4) Start app
+    // Start dashboard code now; it will attach handlers and immediately run.
     initDashboard();
   }
 
   boot().catch(err => {
     console.error(err);
     showClientError(
-      'No se pudieron cargar las librerías de gráficas (Chart.js / DataLabels). ' +
-      'Revisa la consola y tu red. Detalle: ' + (err && err.message ? err.message : String(err))
+      'No se pudieron cargar las librerías (Chart.js / DataLabels). ' +
+      'Detalle: ' + (err && err.message ? err.message : String(err))
     );
-    // Stop loader so the UI isn't stuck
-    const loader = document.getElementById('loader');
-    if (loader) loader.classList.add('hidden');
+    showLoader(false);
   });
-
 })();
 </script>
 
 <script>
 function initDashboard() {
-  // ── Palette ──────────────────────────────────────────────────────────────
   const LIKERT5_COLORS = {
     'Muy satisfecho':  { bg: '#4ade80', border: '#22c55e' },
     'Satisfecho':      { bg: '#86efac', border: '#4ade80' },
@@ -606,15 +582,14 @@ function initDashboard() {
     };
   }
 
-  // ── State ────────────────────────────────────────────────────────────────
-  let chartInstances = [];
-  let currentData = [];
-  let currentChartType = 'bar';
-  let currentFilter = 'all';
-
-  // ── Helpers ──────────────────────────────────────────────────────────────
   function showLoader(show) {
     document.getElementById('loader').classList.toggle('hidden', !show);
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('clientError');
+    el.style.display = 'block';
+    el.textContent = msg;
   }
 
   window.handlePrint = function handlePrint() {
@@ -633,20 +608,23 @@ function initDashboard() {
     });
   }
 
-  // ── Init ─────────────────────────────────────────────────────────────────
-  document.addEventListener('DOMContentLoaded', async () => {
+  let chartInstances = [];
+  let currentData = [];
+  let currentChartType = 'bar';
+  let currentFilter = 'all';
+
+  async function startApp() {
     try {
-      const res = await fetch('/api/planteles');
+      const res = await fetch('/api/planteles', { cache: 'no-store' });
       const planteles = await res.json();
 
-      // If backend errors, show it clearly
       if (!res.ok || (planteles && planteles.error)) {
         throw new Error(planteles && planteles.error ? planteles.error : 'Error cargando /api/planteles');
       }
 
       const sel = document.getElementById('selPlantel');
+      sel.innerHTML = '';
 
-      // Add "Todos los planteles" option
       const optAll = document.createElement('option');
       optAll.value = '__ALL__';
       optAll.textContent = '🏫 Todos los planteles';
@@ -654,13 +632,13 @@ function initDashboard() {
 
       planteles.forEach(p => {
         const o = document.createElement('option');
-        o.value = p; o.textContent = p;
+        o.value = p;
+        o.textContent = p;
         sel.appendChild(o);
       });
 
       sel.addEventListener('change', () => loadPlantel(sel.value));
 
-      // Chart type buttons
       document.querySelectorAll('#chartTypes button').forEach(btn => {
         btn.addEventListener('click', () => {
           document.querySelectorAll('#chartTypes button').forEach(b => b.classList.remove('active'));
@@ -670,29 +648,34 @@ function initDashboard() {
         });
       });
 
-      // Filter
       document.getElementById('selFilter').addEventListener('change', e => {
         currentFilter = e.target.value;
         renderCharts();
       });
 
       updateLegend('likert5');
-      loadPlantel(sel.value);
+
+      // Trigger first load
+      await loadPlantel(sel.value);
     } catch (e) {
       console.error(e);
-      const el = document.getElementById('clientError');
-      el.style.display = 'block';
-      el.textContent = 'Error inicializando datos: ' + (e && e.message ? e.message : String(e));
+      showError('Error inicializando datos: ' + (e && e.message ? e.message : String(e)));
       showLoader(false);
     }
-  });
+  }
 
-  // ── Load plantel data ────────────────────────────────────────────────────
+  // Critical: run even if DOMContentLoaded already fired (common when scripts load async on Vercel)
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', startApp);
+  } else {
+    startApp();
+  }
+
   async function loadPlantel(plantel) {
     showLoader(true);
     try {
       const url = plantel === '__ALL__' ? '/api/data_all' : `/api/data/${encodeURIComponent(plantel)}`;
-      const res = await fetch(url);
+      const res = await fetch(url, { cache: 'no-store' });
       const payload = await res.json();
 
       if (!res.ok || (payload && payload.error)) {
@@ -711,15 +694,12 @@ function initDashboard() {
       renderCharts();
     } catch (e) {
       console.error(e);
-      const el = document.getElementById('clientError');
-      el.style.display = 'block';
-      el.textContent = 'Error cargando datos: ' + (e && e.message ? e.message : String(e));
+      showError('Error cargando datos: ' + (e && e.message ? e.message : String(e)));
     } finally {
       showLoader(false);
     }
   }
 
-  // ── Stats row ────────────────────────────────────────────────────────────
   function renderStats() {
     const row = document.getElementById('statsRow');
     row.innerHTML = '';
@@ -761,24 +741,14 @@ function initDashboard() {
     container.appendChild(d);
   }
 
-  // ── Render all charts ────────────────────────────────────────────────────
   function renderCharts() {
-    if (!window.Chart) {
-      console.error('Chart.js is missing at renderCharts() time.');
-      return;
-    }
-
     chartInstances.forEach(c => c.destroy());
     chartInstances = [];
 
     const container = document.getElementById('sectionsContainer');
     container.innerHTML = '';
 
-    const filtered = currentData.filter(d => {
-      if (currentFilter === 'all') return true;
-      return d.type === currentFilter;
-    });
-
+    const filtered = currentData.filter(d => currentFilter === 'all' ? true : d.type === currentFilter);
     const likert5 = filtered.filter(d => d.type === 'likert5');
     const yesno   = filtered.filter(d => d.type === 'yesno');
 
@@ -790,6 +760,7 @@ function initDashboard() {
       likert5.forEach((q, i) => grid.appendChild(buildCard(q, i)));
       updateLegend('likert5');
     }
+
     if (yesno.length) {
       container.innerHTML += `<div class="section-label">Preguntas Sí / No</div>`;
       const grid = document.createElement('div');
@@ -800,7 +771,6 @@ function initDashboard() {
     }
   }
 
-  // ── Build a single chart card ────────────────────────────────────────────
   function buildCard(q, idx) {
     const card = document.createElement('div');
     card.className = 'chart-card';
@@ -814,7 +784,6 @@ function initDashboard() {
     h3.textContent = q.question;
     card.appendChild(h3);
 
-    // Stacked summary bar
     const totalCount = counts.reduce((a,b) => a+b, 0);
     const bar = document.createElement('div');
     bar.className = 'summary-bar';
@@ -828,7 +797,6 @@ function initDashboard() {
     });
     card.appendChild(bar);
 
-    // Detail pills
     const detailRow = document.createElement('div');
     detailRow.className = 'detail-row';
     q.data.forEach((d, i) => {
@@ -839,7 +807,6 @@ function initDashboard() {
     });
     card.appendChild(detailRow);
 
-    // Canvas
     const wrap = document.createElement('div');
     wrap.className = 'chart-wrap';
     const canvas = document.createElement('canvas');
@@ -848,11 +815,6 @@ function initDashboard() {
     card.appendChild(wrap);
 
     requestAnimationFrame(() => {
-      if (!window.Chart) {
-        console.error('Chart.js missing when trying to create chart.');
-        return;
-      }
-
       const isCartesian = ['bar', 'horizontalBar'].includes(currentChartType);
       const isRadar = currentChartType === 'radar';
       const chartType = currentChartType === 'horizontalBar' ? 'bar' : currentChartType;
@@ -870,7 +832,6 @@ function initDashboard() {
             hoverBackgroundColor: colors.bg,
           }]
         },
-        // DO NOT put ChartDataLabels here; plugin is globally registered via Chart.register(...)
         options: {
           responsive: true,
           maintainAspectRatio: true,
@@ -880,8 +841,6 @@ function initDashboard() {
             legend: { display: false },
             tooltip: {
               backgroundColor: '#1e293b',
-              titleFont: { family: 'Inter', weight: '600' },
-              bodyFont: { family: 'Inter' },
               cornerRadius: 10,
               padding: 12,
               callbacks: {
@@ -904,22 +863,12 @@ function initDashboard() {
             }
           },
           scales: isCartesian ? {
-            x: {
-              grid: { display: false },
-              ticks: { font: { family: 'Inter', size: 11 }, color: '#64748b' },
-            },
-            y: {
-              grid: { color: '#f1f5f9' },
-              ticks: { font: { family: 'Inter', size: 11 }, color: '#64748b' },
-              beginAtZero: true,
-            }
+            x: { grid: { display: false }, ticks: { color: '#64748b' } },
+            y: { grid: { color: '#f1f5f9' }, ticks: { color: '#64748b' }, beginAtZero: true }
           } : (isRadar ? {
             r: { beginAtZero: true, ticks: { display: false }, grid: { color: '#e2e8f0' } }
           } : {}),
-          animation: {
-            duration: 600,
-            easing: 'easeOutQuart',
-          }
+          animation: { duration: 600 }
         }
       };
 
