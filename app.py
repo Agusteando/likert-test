@@ -2,29 +2,41 @@
 """
 Evaluación de Calidad – Dashboard (Flask for Vercel)
 
-Fix for Vercel-only issue where per-plantel charts show 0 while global works:
-- Do NOT send the plantel name in the URL path (/api/data/<plantel>), because unicode/spaces/dashes
-  can get transformed or decoded differently behind proxies/CDNs.
-- Instead, use a stable numeric plantel_id (index in the planteles list) and request /api/data?id=###.
-- Keep /api/planteles returning a plain list of strings (as before), so the dropdown displays normally.
+Update:
+- Data source can be a Google Apps Script exec endpoint (Google Sheets -> JSON).
+- Keeps Vercel-safe /api/data?id=### (numeric plantel_id).
+- Adds a reload endpoint /api/reload to clear cache and refresh data.
+- Fixes chart type switching robustness (avoids late chart renders when switching quickly).
 """
 
 import os
+import json
+import time
+import urllib.request
+import urllib.parse
+from typing import Any, Dict, List, Optional, Tuple
+
 import pandas as pd
 from flask import Flask, jsonify, render_template_string, request
 
 
-# ── Data loading ────────────────────────────────────────────────────────────
+# ── Config ──────────────────────────────────────────────────────────────────
 EXCEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset.xlsx")
+
+DATA_ENDPOINT_URL = os.environ.get("DATA_ENDPOINT_URL", "https://script.google.com/macros/s/AKfycbyWSeFiAu3DnCYanPMdOUuNj6YvEYw7-1VMbRJu6MmmJL1vXE7oLGFS83Tg5gmGVnulHA/exec").strip()
+DATA_ENDPOINT_API_KEY = os.environ.get("DATA_ENDPOINT_API_KEY", "").strip()
+DATA_CACHE_TTL_SECONDS = int(os.environ.get("DATA_CACHE_TTL_SECONDS", "300"))
 
 LIKERT5_ORDER = ["Muy satisfecho", "Satisfecho", "Neutral", "Insatisfecho", "Muy insatisfecho"]
 YESNO_ORDER = ["Sí", "No"]
 
-_df = None
-_likert5_cols = None
-_yesno_cols = None
-_all_question_cols = None
-_plantel_names = None  # list[str] sorted, index = plantel_id
+_df: Optional[pd.DataFrame] = None
+_likert5_cols: Optional[List[str]] = None
+_yesno_cols: Optional[List[str]] = None
+_all_question_cols: Optional[List[str]] = None
+_plantel_names: Optional[List[str]] = None  # list[str] sorted, index = plantel_id
+_loaded_at_epoch: Optional[float] = None
+_loaded_source: str = "unknown"
 
 
 def _clean_text_series(s: pd.Series) -> pd.Series:
@@ -38,9 +50,93 @@ def _clean_text_series(s: pd.Series) -> pd.Series:
     )
 
 
-def load_data():
-    df = pd.read_excel(EXCEL_PATH)
+def _normalize_df_strings(df: pd.DataFrame) -> pd.DataFrame:
+    # Normalize typical “blank” strings into NaN for consistent dropna/unique behavior
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = df[c].apply(lambda x: None if (isinstance(x, str) and x.strip() == "") else x)
+    return df
 
+
+def _build_endpoint_url(base_url: str) -> str:
+    """
+    Ensures mode=records and key=... are present (if configured).
+    """
+    parsed = urllib.parse.urlparse(base_url)
+    q = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
+    # Enforce mode=records (unless user already set a mode)
+    if "mode" not in q:
+        q["mode"] = ["records"]
+
+    # Optional key
+    if DATA_ENDPOINT_API_KEY and "key" not in q:
+        q["key"] = [DATA_ENDPOINT_API_KEY]
+
+    new_query = urllib.parse.urlencode(q, doseq=True)
+    rebuilt = parsed._replace(query=new_query)
+    return urllib.parse.urlunparse(rebuilt)
+
+
+def _http_get_json(url: str, timeout_sec: int = 25) -> Any:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "eval-calidad-dashboard/1.0",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+        raw = resp.read()
+    return json.loads(raw.decode("utf-8", errors="replace"))
+
+
+def load_data_from_endpoint() -> pd.DataFrame:
+    if not DATA_ENDPOINT_URL:
+        raise ValueError("DATA_ENDPOINT_URL is empty")
+
+    url = _build_endpoint_url(DATA_ENDPOINT_URL)
+    payload = _http_get_json(url)
+
+    # Accept multiple shapes for flexibility
+    records: Optional[List[Dict[str, Any]]] = None
+
+    if isinstance(payload, list):
+        # list of dicts
+        records = payload if payload and isinstance(payload[0], dict) else []
+    elif isinstance(payload, dict):
+        if payload.get("ok") is False:
+            raise RuntimeError(payload.get("error") or "Endpoint returned ok:false")
+        if isinstance(payload.get("records"), list):
+            records = payload["records"]
+        elif isinstance(payload.get("data"), list):
+            records = payload["data"]
+        elif isinstance(payload.get("rows"), list) and isinstance(payload.get("columns"), list):
+            cols = payload["columns"]
+            rows = payload["rows"]
+            df = pd.DataFrame(rows, columns=cols)
+            return _normalize_df_strings(df)
+        else:
+            # If dict but unknown structure, try to interpret as records if values look like rows
+            raise RuntimeError("Endpoint JSON structure not recognized. Expected {records:[...]} or list of objects.")
+    else:
+        raise RuntimeError("Endpoint did not return valid JSON (dict or list).")
+
+    df = pd.DataFrame(records or [])
+    df = _normalize_df_strings(df)
+    return df
+
+
+def load_data_from_excel() -> pd.DataFrame:
+    if not os.path.exists(EXCEL_PATH):
+        raise FileNotFoundError(f"dataset.xlsx not found at: {EXCEL_PATH}")
+    df = pd.read_excel(EXCEL_PATH)
+    df = _normalize_df_strings(df)
+    return df
+
+
+def classify_and_prepare(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], List[str]]:
     # Normalize Likert values (fix casing inconsistencies)
     likert_map = {
         "muy satisfecho": "Muy satisfecho",
@@ -62,7 +158,7 @@ def load_data():
         "sugerencias",
     ]
 
-    question_cols = []
+    question_cols: List[str] = []
     for c in df.columns:
         if c is None or str(c) == "None":
             continue
@@ -73,8 +169,8 @@ def load_data():
             question_cols.append(c)
 
     # Classify questions
-    likert5_cols = []
-    yesno_cols = []
+    likert5_cols: List[str] = []
+    yesno_cols: List[str] = []
 
     for c in question_cols:
         vals = set(str(v).strip().lower() for v in df[c].dropna().unique())
@@ -110,34 +206,68 @@ def load_data():
     return df, likert5_cols, yesno_cols
 
 
-def ensure_loaded():
-    global _df, _likert5_cols, _yesno_cols, _all_question_cols, _plantel_names
+def load_data() -> Tuple[pd.DataFrame, List[str], List[str], str]:
+    """
+    Returns df, likert5_cols, yesno_cols, source_label
+    """
+    if DATA_ENDPOINT_URL:
+        df = load_data_from_endpoint()
+        df, likert5_cols, yesno_cols = classify_and_prepare(df)
+        return df, likert5_cols, yesno_cols, "endpoint"
+    else:
+        df = load_data_from_excel()
+        df, likert5_cols, yesno_cols = classify_and_prepare(df)
+        return df, likert5_cols, yesno_cols, "excel"
 
-    if _df is not None:
-        return
 
-    if not os.path.exists(EXCEL_PATH):
-        raise FileNotFoundError(f"dataset.xlsx not found at: {EXCEL_PATH}")
+def clear_cache():
+    global _df, _likert5_cols, _yesno_cols, _all_question_cols, _plantel_names, _loaded_at_epoch, _loaded_source
+    _df = None
+    _likert5_cols = None
+    _yesno_cols = None
+    _all_question_cols = None
+    _plantel_names = None
+    _loaded_at_epoch = None
+    _loaded_source = "unknown"
 
-    df, likert5_cols, yesno_cols = load_data()
+
+def ensure_loaded(force: bool = False):
+    global _df, _likert5_cols, _yesno_cols, _all_question_cols, _plantel_names, _loaded_at_epoch, _loaded_source
+
+    now = time.time()
+    if not force and _df is not None and _loaded_at_epoch is not None:
+        if DATA_CACHE_TTL_SECONDS <= 0:
+            return
+        age = now - _loaded_at_epoch
+        if age < DATA_CACHE_TTL_SECONDS:
+            return
+
+    df, likert5_cols, yesno_cols, source_label = load_data()
 
     _df = df
     _likert5_cols = likert5_cols
     _yesno_cols = yesno_cols
     _all_question_cols = likert5_cols + yesno_cols
 
-    planteles = sorted(df["plantel"].dropna().unique().tolist())
+    planteles = sorted(df["plantel"].dropna().unique().tolist()) if "plantel" in df.columns else []
     _plantel_names = planteles
+
+    _loaded_at_epoch = now
+    _loaded_source = source_label
 
 
 def compute_results(sub_df: pd.DataFrame):
     total = int(len(sub_df))
     results = []
 
+    # Defensive: if columns were not set for some reason
+    if not _all_question_cols or not _likert5_cols or not _yesno_cols:
+        return []
+
     for col in _all_question_cols:
         is_likert5 = col in _likert5_cols
         order = LIKERT5_ORDER if is_likert5 else YESNO_ORDER
-        counts = sub_df[col].value_counts()
+        counts = sub_df[col].value_counts() if col in sub_df.columns else pd.Series(dtype=int)
 
         data = []
         for label in order:
@@ -168,7 +298,6 @@ app = Flask(__name__)
 
 @app.after_request
 def add_no_cache_headers(resp):
-    # Helps avoid confusing cache behavior on some deployments.
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     return resp
@@ -181,13 +310,42 @@ def api_health():
         return jsonify(
             {
                 "ok": True,
-                "rows": int(len(_df)),
-                "planteles": int(len(_plantel_names)),
+                "rows": int(len(_df)) if _df is not None else 0,
+                "planteles": int(len(_plantel_names)) if _plantel_names is not None else 0,
+                "source": _loaded_source,
+                "cache_ttl_seconds": DATA_CACHE_TTL_SECONDS,
+                "loaded_at_epoch": _loaded_at_epoch,
+                "endpoint_configured": bool(DATA_ENDPOINT_URL),
                 "excel_path": EXCEL_PATH,
             }
         )
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e), "excel_path": EXCEL_PATH}), 500
+        return jsonify(
+            {
+                "ok": False,
+                "error": str(e),
+                "endpoint_configured": bool(DATA_ENDPOINT_URL),
+                "excel_path": EXCEL_PATH,
+            }
+        ), 500
+
+
+@app.route("/api/reload", methods=["POST"])
+def api_reload():
+    try:
+        clear_cache()
+        ensure_loaded(force=True)
+        return jsonify(
+            {
+                "ok": True,
+                "rows": int(len(_df)) if _df is not None else 0,
+                "planteles": int(len(_plantel_names)) if _plantel_names is not None else 0,
+                "source": _loaded_source,
+                "loaded_at_epoch": _loaded_at_epoch,
+            }
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/planteles")
@@ -195,7 +353,7 @@ def api_planteles():
     # Keep EXACTLY the old behavior: list of strings.
     try:
         ensure_loaded()
-        return jsonify(_plantel_names)
+        return jsonify(_plantel_names or [])
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -218,11 +376,14 @@ def api_data_by_id():
         except ValueError:
             return jsonify({"error": "Invalid id (must be integer)"}), 400
 
+        if not _plantel_names:
+            return jsonify({"error": "No planteles available"}), 404
+
         if pid < 0 or pid >= len(_plantel_names):
             return jsonify({"error": f"Unknown id {pid}"}), 404
 
         plantel_name = _plantel_names[pid]
-        sub = _df[_df["plantel"] == plantel_name]
+        sub = _df[_df["plantel"] == plantel_name] if _df is not None else pd.DataFrame()
         return jsonify(compute_results(sub))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -232,7 +393,7 @@ def api_data_by_id():
 def api_data_all():
     try:
         ensure_loaded()
-        return jsonify(compute_results(_df))
+        return jsonify(compute_results(_df if _df is not None else pd.DataFrame()))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -242,7 +403,6 @@ def api_data_all():
 def api_data_legacy(plantel):
     try:
         ensure_loaded()
-        # attempt to clean incoming plantel similarly (best-effort)
         plantel_clean = (
             str(plantel)
             .replace("\u00A0", " ")
@@ -250,7 +410,7 @@ def api_data_legacy(plantel):
             .replace("\u2014", "–")
             .strip()
         )
-        sub = _df[_df["plantel"] == plantel_clean]
+        sub = _df[_df["plantel"] == plantel_clean] if _df is not None else pd.DataFrame()
         return jsonify(compute_results(sub))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -492,12 +652,12 @@ HTML = r"""
 
   <div style="display:flex;flex-direction:column;gap:8px;">
     <button class="btn-primary" onclick="handlePrint()">🖨️ Imprimir / Guardar PDF</button>
-    <button class="btn-outline" onclick="location.reload()">↻ Recargar datos</button>
+    <button class="btn-outline" onclick="handleReload()">↻ Recargar datos</button>
   </div>
 
   <div class="sidebar-footer">
     Dashboard generado a partir de las respuestas de la evaluación institucional.<br>
-    Datos cargados de <strong>dataset.xlsx</strong>
+    Datos cargados desde <strong>Google Sheets (Apps Script endpoint)</strong>
   </div>
 </aside>
 
@@ -610,6 +770,17 @@ HTML = r"""
       setTimeout(() => window.print(), 300);
     };
 
+    window.handleReload = async function handleReload() {
+      showLoader(true);
+      try {
+        await fetch('/api/reload', { method: 'POST', cache: 'no-store' });
+      } catch (e) {
+        // If reload fails, still refresh the page
+      } finally {
+        location.reload();
+      }
+    };
+
     function updateLegend(type) {
       const map = type === 'likert5' ? LIKERT5_COLORS : YESNO_COLORS;
       const el = document.getElementById('legendPreview');
@@ -627,9 +798,11 @@ HTML = r"""
     let currentChartType = 'bar';
     let currentFilter = 'all';
 
+    // Render sequence token to avoid late chart creation when switching chart types quickly
+    let renderSeq = 0;
+
     async function startApp() {
       try {
-        // Optional health check (won't change UI, but helps catch Excel missing on Vercel)
         const health = await fetch('/api/health', { cache: 'no-store' });
         if (!health.ok) {
           const t = await health.text();
@@ -645,8 +818,6 @@ HTML = r"""
         const sel = document.getElementById('selPlantel');
         sel.innerHTML = '';
 
-        // Keep the dropdown display EXACTLY like before (strings),
-        // but option.value is now a numeric id (index), which we send to /api/data?id=...
         const optAll = document.createElement('option');
         optAll.value = '__ALL__';
         optAll.textContent = '🏫 Todos los planteles';
@@ -655,13 +826,11 @@ HTML = r"""
         planteles.forEach((name, idx) => {
           const o = document.createElement('option');
           o.value = String(idx);
-          o.textContent = name; // shows normal text (no [object Object])
+          o.textContent = name;
           sel.appendChild(o);
         });
 
-        // Default to global view
         sel.value = '__ALL__';
-
         sel.addEventListener('change', () => loadPlantel(sel.value));
 
         document.querySelectorAll('#chartTypes button').forEach(btn => {
@@ -679,7 +848,6 @@ HTML = r"""
         });
 
         updateLegend('likert5');
-
         await loadPlantel(sel.value);
       } catch (e) {
         console.error(e);
@@ -775,6 +943,9 @@ HTML = r"""
     }
 
     function renderCharts() {
+      renderSeq += 1;
+      const seq = renderSeq;
+
       chartInstances.forEach(c => c.destroy());
       chartInstances = [];
 
@@ -790,7 +961,7 @@ HTML = r"""
         const grid = document.createElement('div');
         grid.className = 'charts-grid';
         container.appendChild(grid);
-        likert5.forEach((q, i) => grid.appendChild(buildCard(q, i)));
+        likert5.forEach((q, i) => grid.appendChild(buildCard(q, i, seq)));
         updateLegend('likert5');
       }
 
@@ -799,12 +970,21 @@ HTML = r"""
         const grid = document.createElement('div');
         grid.className = 'charts-grid';
         container.appendChild(grid);
-        yesno.forEach((q, i) => grid.appendChild(buildCard(q, i + likert5.length)));
+        yesno.forEach((q, i) => grid.appendChild(buildCard(q, i + likert5.length, seq)));
         if (!likert5.length) updateLegend('yesno');
       }
     }
 
-    function buildCard(q, idx) {
+    function hexToRgba(hex, alpha) {
+      const h = (hex || '').replace('#','').trim();
+      if (h.length !== 6) return `rgba(148,163,184,${alpha})`;
+      const r = parseInt(h.slice(0,2), 16);
+      const g = parseInt(h.slice(2,4), 16);
+      const b = parseInt(h.slice(4,6), 16);
+      return `rgba(${r},${g},${b},${alpha})`;
+    }
+
+    function buildCard(q, idx, seq) {
       const card = document.createElement('div');
       card.className = 'chart-card';
 
@@ -848,61 +1028,104 @@ HTML = r"""
       card.appendChild(wrap);
 
       requestAnimationFrame(() => {
-        const isCartesian = ['bar', 'horizontalBar'].includes(currentChartType);
-        const isRadar = currentChartType === 'radar';
-        const chartType = currentChartType === 'horizontalBar' ? 'bar' : currentChartType;
+        // If a newer render started, abort creating this chart
+        if (seq !== renderSeq) return;
+        if (!canvas.isConnected) return;
+        if (!window.Chart) return;
+
+        const originalType = currentChartType;
+        const isCartesian = ['bar', 'horizontalBar'].includes(originalType);
+        const isRadar = originalType === 'radar';
+
+        const chartType = (originalType === 'horizontalBar') ? 'bar' : originalType;
+
+        // Destroy any existing chart bound to this canvas (safety)
+        const existing = window.Chart.getChart(canvas);
+        if (existing) existing.destroy();
+
+        let dataset;
+
+        if (chartType === 'radar') {
+          // Radar works better with a single fill color + per-point colors
+          dataset = {
+            data: counts,
+            backgroundColor: hexToRgba(colors.bg[0] || '#cbd5e1', 0.25),
+            borderColor: colors.border[0] || '#94a3b8',
+            borderWidth: 2,
+            pointBackgroundColor: colors.bg,
+            pointBorderColor: colors.border,
+            pointRadius: 4,
+            pointHoverRadius: 5,
+            fill: true,
+          };
+        } else if (chartType === 'bar') {
+          dataset = {
+            data: counts,
+            backgroundColor: colors.bg.map(c => c + 'cc'),
+            borderColor: colors.border,
+            borderWidth: 2,
+            borderRadius: 8,
+            hoverBackgroundColor: colors.bg,
+          };
+        } else {
+          // pie/doughnut/polarArea
+          dataset = {
+            data: counts,
+            backgroundColor: colors.bg.map(c => c + 'cc'),
+            borderColor: colors.border,
+            borderWidth: 2,
+            hoverBackgroundColor: colors.bg,
+          };
+        }
+
+        const options = {
+          responsive: true,
+          maintainAspectRatio: true,
+          layout: { padding: { top: 10, bottom: 4 } },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: '#1e293b',
+              cornerRadius: 10,
+              padding: 12,
+              callbacks: {
+                label: ctx => {
+                  const i = ctx.dataIndex;
+                  return `${labels[i]}: ${counts[i]} (${pcts[i]}%)`;
+                }
+              }
+            },
+            datalabels: {
+              color: (isCartesian || isRadar) ? '#1e293b' : '#fff',
+              font: { family: 'Inter', weight: '700', size: 12 },
+              anchor: isCartesian ? 'end' : 'center',
+              align: isCartesian ? (originalType === 'horizontalBar' ? 'end' : 'top') : 'center',
+              offset: isCartesian ? 4 : 0,
+              formatter: (val, ctx) => {
+                const p = pcts[ctx.dataIndex];
+                return val > 0 ? `${p}%` : '';
+              },
+            }
+          },
+          animation: { duration: 600 }
+        };
+
+        if (isCartesian) {
+          options.indexAxis = (originalType === 'horizontalBar') ? 'y' : 'x';
+          options.scales = {
+            x: { grid: { display: false }, ticks: { color: '#64748b' } },
+            y: { grid: { color: '#f1f5f9' }, ticks: { color: '#64748b' }, beginAtZero: true }
+          };
+        } else if (isRadar) {
+          options.scales = {
+            r: { beginAtZero: true, ticks: { display: false }, grid: { color: '#e2e8f0' } }
+          };
+        }
 
         const cfg = {
           type: chartType,
-          data: {
-            labels: labels,
-            datasets: [{
-              data: counts,
-              backgroundColor: colors.bg.map(c => c + 'cc'),
-              borderColor: colors.border,
-              borderWidth: 2,
-              borderRadius: isCartesian ? 8 : 0,
-              hoverBackgroundColor: colors.bg,
-            }]
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: true,
-            indexAxis: currentChartType === 'horizontalBar' ? 'y' : 'x',
-            layout: { padding: { top: 10, bottom: 4 } },
-            plugins: {
-              legend: { display: false },
-              tooltip: {
-                backgroundColor: '#1e293b',
-                cornerRadius: 10,
-                padding: 12,
-                callbacks: {
-                  label: ctx => {
-                    const i = ctx.dataIndex;
-                    return `${labels[i]}: ${counts[i]} (${pcts[i]}%)`;
-                  }
-                }
-              },
-              datalabels: {
-                color: isCartesian || isRadar ? '#1e293b' : '#fff',
-                font: { family: 'Inter', weight: '700', size: 12 },
-                anchor: isCartesian ? 'end' : 'center',
-                align: isCartesian ? (currentChartType === 'horizontalBar' ? 'end' : 'top') : 'center',
-                offset: isCartesian ? 4 : 0,
-                formatter: (val, ctx) => {
-                  const p = pcts[ctx.dataIndex];
-                  return val > 0 ? `${p}%` : '';
-                },
-              }
-            },
-            scales: isCartesian ? {
-              x: { grid: { display: false }, ticks: { color: '#64748b' } },
-              y: { grid: { color: '#f1f5f9' }, ticks: { color: '#64748b' }, beginAtZero: true }
-            } : (isRadar ? {
-              r: { beginAtZero: true, ticks: { display: false }, grid: { color: '#e2e8f0' } }
-            } : {}),
-            animation: { duration: 600 }
-          }
+          data: { labels, datasets: [dataset] },
+          options
         };
 
         const chart = new window.Chart(canvas.getContext('2d'), cfg);
