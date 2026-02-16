@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-Evaluación de Calidad – Dashboard Generator
-Web UI to visualize Likert-scale survey results per plantel.
+Evaluación de Calidad – Dashboard Generator (Flask + Vercel)
+
+Key Vercel fix:
+- Do NOT use the raw plantel string in the URL path (/api/data/<plantel>).
+  Unicode, spaces, and some proxies/CDNs can cause mismatches.
+- Instead, use a stable numeric plantel_id and request /api/data?id=###.
+
+This resolves: "All planteles show 0 on Vercel but work locally", while /api/data_all works.
 """
 
 import os
 import pandas as pd
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 
 # ── Data loading ────────────────────────────────────────────────────────────
@@ -19,12 +25,16 @@ _df = None
 _likert5_cols = None
 _yesno_cols = None
 _all_question_cols = None
-_planteles = None
+
+# Plantel id mapping (Vercel-safe)
+_plantel_names = None            # list[str], index = plantel_id
+_plantel_name_to_id = None       # dict[str, int]
 
 
 def load_data():
     df = pd.read_excel(EXCEL_PATH)
 
+    # Normalize Likert values (fix casing inconsistencies)
     likert_map = {
         "muy satisfecho": "Muy satisfecho",
         "satisfecho": "Satisfecho",
@@ -33,6 +43,7 @@ def load_data():
         "muy insatisfecho": "Muy insatisfecho",
     }
 
+    # Identify question columns (skip metadata, open-text, and null columns)
     skip_keywords = [
         "marca temporal",
         "nombre del alumno",
@@ -54,6 +65,7 @@ def load_data():
         if len(vals) <= 10:
             question_cols.append(c)
 
+    # Classify questions
     likert5_cols = []
     yesno_cols = []
 
@@ -75,8 +87,19 @@ def load_data():
                 ) if pd.notna(x) else x
             )
 
+    # Clean NBSP / whitespace just in case
+    def clean_series(s):
+        return (
+            s.astype(str)
+            .str.replace("\u00A0", " ", regex=False)
+            .str.replace(r"\s+", " ", regex=True)
+            .str.strip()
+        )
+
     if "Nivel Educativo" in df.columns and "Campus" in df.columns:
-        df["plantel"] = df["Nivel Educativo"].astype(str).str.strip() + " – " + df["Campus"].astype(str).str.strip()
+        ne = clean_series(df["Nivel Educativo"])
+        ca = clean_series(df["Campus"])
+        df["plantel"] = ne + " – " + ca
     else:
         df["plantel"] = "Plantel"
 
@@ -84,7 +107,8 @@ def load_data():
 
 
 def ensure_loaded():
-    global _df, _likert5_cols, _yesno_cols, _all_question_cols, _planteles
+    global _df, _likert5_cols, _yesno_cols, _all_question_cols, _plantel_names, _plantel_name_to_id
+
     if _df is not None:
         return
 
@@ -92,85 +116,124 @@ def ensure_loaded():
         raise FileNotFoundError(f"dataset.xlsx not found at: {EXCEL_PATH}")
 
     df, likert5_cols, yesno_cols = load_data()
+
     _df = df
     _likert5_cols = likert5_cols
     _yesno_cols = yesno_cols
     _all_question_cols = likert5_cols + yesno_cols
-    _planteles = sorted(df["plantel"].dropna().unique().tolist())
+
+    # IMPORTANT: build a stable, Vercel-safe id list for planteles
+    planteles = sorted(df["plantel"].dropna().unique().tolist())
+    _plantel_names = planteles
+    _plantel_name_to_id = {name: i for i, name in enumerate(_plantel_names)}
+
+
+def compute_results(sub_df: pd.DataFrame):
+    total = int(len(sub_df))
+    results = []
+
+    for col in _all_question_cols:
+        is_likert5 = col in _likert5_cols
+        order = LIKERT5_ORDER if is_likert5 else YESNO_ORDER
+        counts = sub_df[col].value_counts()
+
+        data = []
+        for label in order:
+            c = int(counts.get(label, 0))
+            data.append({"label": label, "count": c, "pct": round(c / total * 100, 1) if total > 0 else 0})
+
+        results.append(
+            {
+                "question": col,
+                "type": "likert5" if is_likert5 else "yesno",
+                "total": total,
+                "data": data,
+            }
+        )
+
+    return results
 
 
 # ── Flask app ───────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 
-@app.route("/api/planteles")
-def api_planteles():
+@app.route("/api/health")
+def api_health():
     try:
         ensure_loaded()
-        return jsonify(_planteles)
+        return jsonify(
+            {
+                "ok": True,
+                "rows": int(len(_df)),
+                "planteles": int(len(_plantel_names)),
+                "excel_path": EXCEL_PATH,
+            }
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "excel_path": EXCEL_PATH}), 500
+
+
+@app.route("/api/planteles")
+def api_planteles():
+    """
+    Returns:
+      [
+        {"id": 0, "name": "Nivel – Campus"},
+        ...
+      ]
+    """
+    try:
+        ensure_loaded()
+        return jsonify([{"id": i, "name": name} for i, name in enumerate(_plantel_names)])
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/data/<plantel>")
-def api_data(plantel):
+@app.route("/api/data")
+def api_data_by_id():
+    """
+    Vercel-safe endpoint:
+      /api/data?id=123
+    """
     try:
         ensure_loaded()
-        sub = _df[_df["plantel"] == plantel]
-        total = int(len(sub))
-        results = []
+        plantel_id = request.args.get("id", None)
+        if plantel_id is None:
+            return jsonify({"error": "Missing query param ?id=PLANTEL_ID"}), 400
 
-        for col in _all_question_cols:
-            is_likert5 = col in _likert5_cols
-            order = LIKERT5_ORDER if is_likert5 else YESNO_ORDER
-            counts = sub[col].value_counts()
+        try:
+            pid = int(plantel_id)
+        except ValueError:
+            return jsonify({"error": "Invalid id (must be integer)"}), 400
 
-            data = []
-            for label in order:
-                c = int(counts.get(label, 0))
-                data.append({"label": label, "count": c, "pct": round(c / total * 100, 1) if total > 0 else 0})
+        if pid < 0 or pid >= len(_plantel_names):
+            return jsonify({"error": f"Unknown id {pid}"}), 404
 
-            results.append(
-                {
-                    "question": col,
-                    "type": "likert5" if is_likert5 else "yesno",
-                    "total": total,
-                    "data": data,
-                }
-            )
-
-        return jsonify(results)
+        plantel_name = _plantel_names[pid]
+        sub = _df[_df["plantel"] == plantel_name]
+        return jsonify(compute_results(sub))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/data_all")
 def api_data_all():
+    """Aggregated data across ALL planteles (global view)."""
     try:
         ensure_loaded()
-        total = int(len(_df))
-        results = []
+        return jsonify(compute_results(_df))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-        for col in _all_question_cols:
-            is_likert5 = col in _likert5_cols
-            order = LIKERT5_ORDER if is_likert5 else YESNO_ORDER
-            counts = _df[col].value_counts()
 
-            data = []
-            for label in order:
-                c = int(counts.get(label, 0))
-                data.append({"label": label, "count": c, "pct": round(c / total * 100, 1) if total > 0 else 0})
-
-            results.append(
-                {
-                    "question": col,
-                    "type": "likert5" if is_likert5 else "yesno",
-                    "total": total,
-                    "data": data,
-                }
-            )
-
-        return jsonify(results)
+# Keep old route for backwards compatibility (not used by the updated UI)
+@app.route("/api/data/<plantel>")
+def api_data_legacy(plantel):
+    try:
+        ensure_loaded()
+        sub = _df[_df["plantel"] == plantel]
+        return jsonify(compute_results(sub))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -197,15 +260,6 @@ HTML = r"""
     --text-muted:#64748b;
     --border:    #e2e8f0;
     --radius:    16px;
-
-    --l5-1: #4ade80;
-    --l5-2: #86efac;
-    --l5-3: #fde047;
-    --l5-4: #fca5a5;
-    --l5-5: #f87171;
-
-    --yn-yes: #4ade80;
-    --yn-no:  #f87171;
   }
 
   *, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
@@ -280,9 +334,7 @@ HTML = r"""
   }
 
   .filter-section { display: flex; flex-direction: column; gap: 16px; }
-  .chart-type-grid {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
-  }
+  .chart-type-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   .chart-type-grid button {
     padding: 7px 8px; font-size: 0.78rem; border-radius: 8px;
     background: #334155; border: 1px solid #475569; color: #cbd5e1;
@@ -296,26 +348,16 @@ HTML = r"""
     display: flex; flex-direction: column; gap: 5px;
     padding: 12px; background: #0f172a; border-radius: 10px;
   }
-  .legend-row {
-    display: flex; align-items: center; gap: 8px; font-size: 0.75rem;
-  }
-  .legend-dot {
-    width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0;
-  }
+  .legend-row { display: flex; align-items: center; gap: 8px; font-size: 0.75rem; }
+  .legend-dot { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
 
-  .main {
-    margin-left: 310px;
-    flex: 1;
-    padding: 40px 48px;
-  }
+  .main { margin-left: 310px; flex: 1; padding: 40px 48px; }
 
   .header-bar {
     display: flex; align-items: center; justify-content: space-between;
     margin-bottom: 36px;
   }
-  .header-bar h2 {
-    font-size: 1.6rem; font-weight: 700;
-  }
+  .header-bar h2 { font-size: 1.6rem; font-weight: 700; }
   .header-bar .badge {
     background: var(--accent); color: #fff;
     padding: 6px 16px; border-radius: 50px;
@@ -354,26 +396,13 @@ HTML = r"""
     box-shadow: 0 1px 4px rgba(0,0,0,.05);
     break-inside: avoid;
   }
-  .chart-card h3 {
-    font-size: 0.88rem; font-weight: 600; line-height: 1.45;
-    margin-bottom: 18px; color: var(--text);
-  }
-  .chart-card .chart-wrap {
-    position: relative; width: 100%; min-height: 250px;
-  }
+  .chart-card h3 { font-size: 0.88rem; font-weight: 600; line-height: 1.45; margin-bottom: 18px; color: var(--text); }
+  .chart-card .chart-wrap { position: relative; width: 100%; min-height: 250px; }
   .chart-card canvas { width: 100% !important; }
 
-  .chart-card .summary-bar {
-    display: flex; margin-top: 14px; border-radius: 8px; overflow: hidden; height: 10px;
-  }
-
-  .chart-card .detail-row {
-    display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px;
-  }
-  .detail-pill {
-    display: flex; align-items: center; gap: 5px;
-    font-size: 0.72rem; color: var(--text-muted);
-  }
+  .chart-card .summary-bar { display: flex; margin-top: 14px; border-radius: 8px; overflow: hidden; height: 10px; }
+  .chart-card .detail-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+  .detail-pill { display: flex; align-items: center; gap: 5px; font-size: 0.72rem; color: var(--text-muted); }
   .detail-pill .dot { width: 8px; height: 8px; border-radius: 2px; }
 
   .loading-overlay {
@@ -401,23 +430,14 @@ HTML = r"""
     color: #7f1d1d;
     font-size: 0.9rem;
     line-height: 1.35;
-  }
-
-  @media print {
-    body { background: #fff; }
-    .sidebar { display: none !important; }
-    .main { margin-left: 0; padding: 20px; }
-    .chart-card { break-inside: avoid; box-shadow: none; border: 1px solid #e2e8f0; }
-    .charts-grid { grid-template-columns: 1fr 1fr; gap: 16px; }
+    white-space: pre-wrap;
   }
 </style>
 </head>
-<body>
 
+<body>
 <aside class="sidebar">
-  <div>
-    <h1>📊 Evaluación de <span>Calidad</span> del Servicio</h1>
-  </div>
+  <div><h1>📊 Evaluación de <span>Calidad</span> del Servicio</h1></div>
 
   <div class="filter-section">
     <div class="ctrl-group">
@@ -472,30 +492,23 @@ HTML = r"""
   </div>
 
   <div id="clientError" class="error-banner" style="display:none;"></div>
-
   <div class="stats-row" id="statsRow"></div>
   <div id="sectionsContainer"></div>
 </div>
 
 <script>
-/*
-  IMPORTANT FIX for "stuck on Loading" in Vercel:
-  We load Chart.js + DataLabels asynchronously. That can complete AFTER DOMContentLoaded.
-  If your app only starts inside a DOMContentLoaded listener, it may never run.
-  So we start immediately if the DOM is already ready.
-*/
 (function () {
-  function showClientError(msg) {
-    const el = document.getElementById('clientError');
-    if (!el) return;
-    el.style.display = 'block';
-    el.textContent = msg;
-  }
-
   function showLoader(show) {
     const loader = document.getElementById('loader');
     if (!loader) return;
     loader.classList.toggle('hidden', !show);
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('clientError');
+    if (!el) return;
+    el.style.display = 'block';
+    el.textContent = msg;
   }
 
   function loadScript(src) {
@@ -530,355 +543,362 @@ HTML = r"""
       'https://unpkg.com/chart.js@4.4.1/dist/chart.umd.min.js'
     ]);
 
-    if (!window.Chart) {
-      throw new Error('Chart.js loaded but window.Chart is missing.');
-    }
+    if (!window.Chart) throw new Error('Chart.js loaded but window.Chart is missing.');
 
     await loadFirstAvailable([
       'https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js',
       'https://unpkg.com/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js'
     ]);
 
-    if (!window.ChartDataLabels) {
-      throw new Error('chartjs-plugin-datalabels loaded but window.ChartDataLabels is missing.');
-    }
+    if (!window.ChartDataLabels) throw new Error('DataLabels loaded but window.ChartDataLabels is missing.');
 
     window.Chart.register(window.ChartDataLabels);
 
-    // Start dashboard code now; it will attach handlers and immediately run.
     initDashboard();
   }
 
   boot().catch(err => {
     console.error(err);
-    showClientError(
-      'No se pudieron cargar las librerías (Chart.js / DataLabels). ' +
-      'Detalle: ' + (err && err.message ? err.message : String(err))
-    );
+    showError('No se pudieron cargar las librerías (Chart.js / DataLabels).\n' + (err?.message || String(err)));
     showLoader(false);
   });
-})();
-</script>
 
-<script>
-function initDashboard() {
-  const LIKERT5_COLORS = {
-    'Muy satisfecho':  { bg: '#4ade80', border: '#22c55e' },
-    'Satisfecho':      { bg: '#86efac', border: '#4ade80' },
-    'Neutral':         { bg: '#fde047', border: '#facc15' },
-    'Insatisfecho':    { bg: '#fca5a5', border: '#f87171' },
-    'Muy insatisfecho':{ bg: '#f87171', border: '#ef4444' },
-  };
-  const YESNO_COLORS = {
-    'Sí': { bg: '#4ade80', border: '#22c55e' },
-    'No': { bg: '#f87171', border: '#ef4444' },
-  };
-
-  function getColors(type, labels) {
-    const map = type === 'likert5' ? LIKERT5_COLORS : YESNO_COLORS;
-    return {
-      bg: labels.map(l => (map[l]||{bg:'#cbd5e1'}).bg),
-      border: labels.map(l => (map[l]||{border:'#94a3b8'}).border),
+  function initDashboard() {
+    const LIKERT5_COLORS = {
+      'Muy satisfecho':  { bg: '#4ade80', border: '#22c55e' },
+      'Satisfecho':      { bg: '#86efac', border: '#4ade80' },
+      'Neutral':         { bg: '#fde047', border: '#facc15' },
+      'Insatisfecho':    { bg: '#fca5a5', border: '#f87171' },
+      'Muy insatisfecho':{ bg: '#f87171', border: '#ef4444' },
     };
-  }
+    const YESNO_COLORS = {
+      'Sí': { bg: '#4ade80', border: '#22c55e' },
+      'No': { bg: '#f87171', border: '#ef4444' },
+    };
 
-  function showLoader(show) {
-    document.getElementById('loader').classList.toggle('hidden', !show);
-  }
+    function getColors(type, labels) {
+      const map = type === 'likert5' ? LIKERT5_COLORS : YESNO_COLORS;
+      return {
+        bg: labels.map(l => (map[l]||{bg:'#cbd5e1'}).bg),
+        border: labels.map(l => (map[l]||{border:'#94a3b8'}).border),
+      };
+    }
 
-  function showError(msg) {
-    const el = document.getElementById('clientError');
-    el.style.display = 'block';
-    el.textContent = msg;
-  }
+    function showLoader(show) {
+      document.getElementById('loader').classList.toggle('hidden', !show);
+    }
 
-  window.handlePrint = function handlePrint() {
-    setTimeout(() => window.print(), 300);
-  };
+    function showError(msg) {
+      const el = document.getElementById('clientError');
+      el.style.display = 'block';
+      el.textContent = msg;
+    }
 
-  function updateLegend(type) {
-    const map = type === 'likert5' ? LIKERT5_COLORS : YESNO_COLORS;
-    const el = document.getElementById('legendPreview');
-    el.innerHTML = '';
-    Object.entries(map).forEach(([label, c]) => {
-      const row = document.createElement('div');
-      row.className = 'legend-row';
-      row.innerHTML = `<span class="legend-dot" style="background:${c.bg}"></span><span>${label}</span>`;
-      el.appendChild(row);
-    });
-  }
+    window.handlePrint = function handlePrint() {
+      setTimeout(() => window.print(), 300);
+    };
 
-  let chartInstances = [];
-  let currentData = [];
-  let currentChartType = 'bar';
-  let currentFilter = 'all';
-
-  async function startApp() {
-    try {
-      const res = await fetch('/api/planteles', { cache: 'no-store' });
-      const planteles = await res.json();
-
-      if (!res.ok || (planteles && planteles.error)) {
-        throw new Error(planteles && planteles.error ? planteles.error : 'Error cargando /api/planteles');
-      }
-
-      const sel = document.getElementById('selPlantel');
-      sel.innerHTML = '';
-
-      const optAll = document.createElement('option');
-      optAll.value = '__ALL__';
-      optAll.textContent = '🏫 Todos los planteles';
-      sel.appendChild(optAll);
-
-      planteles.forEach(p => {
-        const o = document.createElement('option');
-        o.value = p;
-        o.textContent = p;
-        sel.appendChild(o);
+    function updateLegend(type) {
+      const map = type === 'likert5' ? LIKERT5_COLORS : YESNO_COLORS;
+      const el = document.getElementById('legendPreview');
+      el.innerHTML = '';
+      Object.entries(map).forEach(([label, c]) => {
+        const row = document.createElement('div');
+        row.className = 'legend-row';
+        row.innerHTML = `<span class="legend-dot" style="background:${c.bg}"></span><span>${label}</span>`;
+        el.appendChild(row);
       });
+    }
 
-      sel.addEventListener('change', () => loadPlantel(sel.value));
+    let chartInstances = [];
+    let currentData = [];
+    let currentChartType = 'bar';
+    let currentFilter = 'all';
 
-      document.querySelectorAll('#chartTypes button').forEach(btn => {
-        btn.addEventListener('click', () => {
-          document.querySelectorAll('#chartTypes button').forEach(b => b.classList.remove('active'));
-          btn.classList.add('active');
-          currentChartType = btn.dataset.type;
+    async function startApp() {
+      try {
+        // Optional quick backend check (helps diagnose Vercel data file issues)
+        const health = await fetch('/api/health', { cache: 'no-store' });
+        if (!health.ok) {
+          const t = await health.text();
+          throw new Error('Backend health failed: ' + t);
+        }
+
+        const res = await fetch('/api/planteles', { cache: 'no-store' });
+        const planteles = await res.json();
+
+        if (!res.ok || (planteles && planteles.error)) {
+          throw new Error(planteles?.error || 'Error cargando /api/planteles');
+        }
+
+        const sel = document.getElementById('selPlantel');
+        sel.innerHTML = '';
+
+        const optAll = document.createElement('option');
+        optAll.value = '__ALL__';
+        optAll.textContent = '🏫 Todos los planteles';
+        sel.appendChild(optAll);
+
+        // IMPORTANT: option value is the numeric id (Vercel-safe)
+        planteles.forEach(p => {
+          const o = document.createElement('option');
+          o.value = String(p.id);
+          o.textContent = p.name;
+          sel.appendChild(o);
+        });
+
+        sel.addEventListener('change', () => loadPlantel(sel.value));
+
+        document.querySelectorAll('#chartTypes button').forEach(btn => {
+          btn.addEventListener('click', () => {
+            document.querySelectorAll('#chartTypes button').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            currentChartType = btn.dataset.type;
+            renderCharts();
+          });
+        });
+
+        document.getElementById('selFilter').addEventListener('change', e => {
+          currentFilter = e.target.value;
           renderCharts();
         });
-      });
 
-      document.getElementById('selFilter').addEventListener('change', e => {
-        currentFilter = e.target.value;
-        renderCharts();
-      });
+        updateLegend('likert5');
 
-      updateLegend('likert5');
-
-      // Trigger first load
-      await loadPlantel(sel.value);
-    } catch (e) {
-      console.error(e);
-      showError('Error inicializando datos: ' + (e && e.message ? e.message : String(e)));
-      showLoader(false);
+        // first load (defaults to __ALL__)
+        await loadPlantel(sel.value);
+      } catch (e) {
+        console.error(e);
+        showError('Error inicializando:\n' + (e?.message || String(e)));
+        showLoader(false);
+      }
     }
-  }
 
-  // Critical: run even if DOMContentLoaded already fired (common when scripts load async on Vercel)
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', startApp);
-  } else {
-    startApp();
-  }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', startApp);
+    } else {
+      startApp();
+    }
 
-  async function loadPlantel(plantel) {
-    showLoader(true);
-    try {
-      const url = plantel === '__ALL__' ? '/api/data_all' : `/api/data/${encodeURIComponent(plantel)}`;
-      const res = await fetch(url, { cache: 'no-store' });
-      const payload = await res.json();
+    async function loadPlantel(value) {
+      showLoader(true);
+      try {
+        let url;
+        let displayName;
 
-      if (!res.ok || (payload && payload.error)) {
-        throw new Error(payload && payload.error ? payload.error : ('Error cargando ' + url));
+        if (value === '__ALL__') {
+          url = '/api/data_all';
+          displayName = 'Todos los Planteles';
+        } else {
+          // IMPORTANT: use id query param, NOT plantel name in the path
+          url = `/api/data?id=${encodeURIComponent(value)}`;
+          const sel = document.getElementById('selPlantel');
+          displayName = sel.options[sel.selectedIndex]?.textContent || 'Plantel';
+        }
+
+        const res = await fetch(url, { cache: 'no-store' });
+        const payload = await res.json();
+
+        if (!res.ok || (payload && payload.error)) {
+          throw new Error(payload?.error || ('Error cargando ' + url));
+        }
+
+        currentData = payload;
+
+        document.getElementById('titlePlantel').textContent = displayName;
+        const total = currentData.length > 0 ? currentData[0].total : 0;
+        document.getElementById('badgeN').textContent = `${total} respuestas`;
+
+        renderStats();
+        renderCharts();
+      } catch (e) {
+        console.error(e);
+        showError('Error cargando datos:\n' + (e?.message || String(e)));
+      } finally {
+        showLoader(false);
+      }
+    }
+
+    function renderStats() {
+      const row = document.getElementById('statsRow');
+      row.innerHTML = '';
+
+      const likert5 = currentData.filter(d => d.type === 'likert5');
+      const yesno   = currentData.filter(d => d.type === 'yesno');
+
+      if (likert5.length) {
+        let totalPositive = 0, totalAll = 0;
+        likert5.forEach(q => {
+          const ms = q.data.find(d => d.label === 'Muy satisfecho')?.count || 0;
+          const s  = q.data.find(d => d.label === 'Satisfecho')?.count || 0;
+          const all = q.data.reduce((a,b) => a + b.count, 0);
+          totalPositive += ms + s;
+          totalAll += all;
+        });
+        const pct = totalAll > 0 ? (totalPositive / totalAll * 100).toFixed(1) : 0;
+        addStat(row, 'Satisfacción positiva', pct + '%', pct >= 70 ? '#4ade80' : pct >= 50 ? '#fde047' : '#f87171');
       }
 
-      currentData = payload;
+      if (yesno.length) {
+        let totalSi = 0, totalAll = 0;
+        yesno.forEach(q => {
+          totalSi  += q.data.find(d => d.label === 'Sí')?.count || 0;
+          totalAll += q.data.reduce((a,b) => a + b.count, 0);
+        });
+        const pct = totalAll > 0 ? (totalSi / totalAll * 100).toFixed(1) : 0;
+        addStat(row, 'Respuestas "Sí"', pct + '%', pct >= 70 ? '#4ade80' : pct >= 50 ? '#fde047' : '#f87171');
+      }
 
-      const displayName = plantel === '__ALL__' ? 'Todos los Planteles' : plantel;
-      document.getElementById('titlePlantel').textContent = displayName;
-
-      const total = currentData.length > 0 ? currentData[0].total : 0;
-      document.getElementById('badgeN').textContent = `${total} respuestas`;
-
-      renderStats();
-      renderCharts();
-    } catch (e) {
-      console.error(e);
-      showError('Error cargando datos: ' + (e && e.message ? e.message : String(e)));
-    } finally {
-      showLoader(false);
+      addStat(row, 'Preguntas de satisfacción', likert5.length, '#818cf8');
+      addStat(row, 'Preguntas Sí/No', yesno.length, '#818cf8');
     }
-  }
 
-  function renderStats() {
-    const row = document.getElementById('statsRow');
-    row.innerHTML = '';
+    function addStat(container, label, value, color) {
+      const d = document.createElement('div');
+      d.className = 'stat-card';
+      d.innerHTML = `<div class="stat-label">${label}</div><div class="stat-value" style="color:${color}">${value}</div>`;
+      container.appendChild(d);
+    }
 
-    const likert5 = currentData.filter(d => d.type === 'likert5');
-    const yesno   = currentData.filter(d => d.type === 'yesno');
+    function renderCharts() {
+      chartInstances.forEach(c => c.destroy());
+      chartInstances = [];
 
-    if (likert5.length) {
-      let totalPositive = 0, totalAll = 0;
-      likert5.forEach(q => {
-        const ms = q.data.find(d => d.label === 'Muy satisfecho')?.count || 0;
-        const s  = q.data.find(d => d.label === 'Satisfecho')?.count || 0;
-        const all = q.data.reduce((a,b) => a + b.count, 0);
-        totalPositive += ms + s;
-        totalAll += all;
+      const container = document.getElementById('sectionsContainer');
+      container.innerHTML = '';
+
+      const filtered = currentData.filter(d => currentFilter === 'all' ? true : d.type === currentFilter);
+      const likert5 = filtered.filter(d => d.type === 'likert5');
+      const yesno   = filtered.filter(d => d.type === 'yesno');
+
+      if (likert5.length) {
+        container.innerHTML += `<div class="section-label">Preguntas de Satisfacción (Escala Likert 5 puntos)</div>`;
+        const grid = document.createElement('div');
+        grid.className = 'charts-grid';
+        container.appendChild(grid);
+        likert5.forEach((q, i) => grid.appendChild(buildCard(q, i)));
+        updateLegend('likert5');
+      }
+
+      if (yesno.length) {
+        container.innerHTML += `<div class="section-label">Preguntas Sí / No</div>`;
+        const grid = document.createElement('div');
+        grid.className = 'charts-grid';
+        container.appendChild(grid);
+        yesno.forEach((q, i) => grid.appendChild(buildCard(q, i + likert5.length)));
+        if (!likert5.length) updateLegend('yesno');
+      }
+    }
+
+    function buildCard(q, idx) {
+      const card = document.createElement('div');
+      card.className = 'chart-card';
+
+      const labels = q.data.map(d => d.label);
+      const counts = q.data.map(d => d.count);
+      const pcts   = q.data.map(d => d.pct);
+      const colors = getColors(q.type, labels);
+
+      const h3 = document.createElement('h3');
+      h3.textContent = q.question;
+      card.appendChild(h3);
+
+      const totalCount = counts.reduce((a,b) => a+b, 0);
+      const bar = document.createElement('div');
+      bar.className = 'summary-bar';
+      q.data.forEach((d, i) => {
+        const seg = document.createElement('div');
+        const w = totalCount > 0 ? (d.count / totalCount * 100) : 0;
+        seg.style.width = w + '%';
+        seg.style.background = colors.bg[i];
+        seg.title = `${d.label}: ${d.count} (${d.pct}%)`;
+        bar.appendChild(seg);
       });
-      const pct = totalAll > 0 ? (totalPositive / totalAll * 100).toFixed(1) : 0;
-      addStat(row, 'Satisfacción positiva', pct + '%', pct >= 70 ? '#4ade80' : pct >= 50 ? '#fde047' : '#f87171');
-    }
+      card.appendChild(bar);
 
-    if (yesno.length) {
-      let totalSi = 0, totalAll = 0;
-      yesno.forEach(q => {
-        totalSi  += q.data.find(d => d.label === 'Sí')?.count || 0;
-        totalAll += q.data.reduce((a,b) => a + b.count, 0);
+      const detailRow = document.createElement('div');
+      detailRow.className = 'detail-row';
+      q.data.forEach((d, i) => {
+        const pill = document.createElement('span');
+        pill.className = 'detail-pill';
+        pill.innerHTML = `<span class="dot" style="background:${colors.bg[i]}"></span>${d.label}: <strong>${d.count}</strong> (${d.pct}%)`;
+        detailRow.appendChild(pill);
       });
-      const pct = totalAll > 0 ? (totalSi / totalAll * 100).toFixed(1) : 0;
-      addStat(row, 'Respuestas "Sí"', pct + '%', pct >= 70 ? '#4ade80' : pct >= 50 ? '#fde047' : '#f87171');
-    }
+      card.appendChild(detailRow);
 
-    addStat(row, 'Preguntas de satisfacción', likert5.length, '#818cf8');
-    addStat(row, 'Preguntas Sí/No', yesno.length, '#818cf8');
-  }
+      const wrap = document.createElement('div');
+      wrap.className = 'chart-wrap';
+      const canvas = document.createElement('canvas');
+      canvas.id = 'chart_' + idx;
+      wrap.appendChild(canvas);
+      card.appendChild(wrap);
 
-  function addStat(container, label, value, color) {
-    const d = document.createElement('div');
-    d.className = 'stat-card';
-    d.innerHTML = `<div class="stat-label">${label}</div><div class="stat-value" style="color:${color}">${value}</div>`;
-    container.appendChild(d);
-  }
+      requestAnimationFrame(() => {
+        const isCartesian = ['bar', 'horizontalBar'].includes(currentChartType);
+        const isRadar = currentChartType === 'radar';
+        const chartType = currentChartType === 'horizontalBar' ? 'bar' : currentChartType;
 
-  function renderCharts() {
-    chartInstances.forEach(c => c.destroy());
-    chartInstances = [];
-
-    const container = document.getElementById('sectionsContainer');
-    container.innerHTML = '';
-
-    const filtered = currentData.filter(d => currentFilter === 'all' ? true : d.type === currentFilter);
-    const likert5 = filtered.filter(d => d.type === 'likert5');
-    const yesno   = filtered.filter(d => d.type === 'yesno');
-
-    if (likert5.length) {
-      container.innerHTML += `<div class="section-label">Preguntas de Satisfacción (Escala Likert 5 puntos)</div>`;
-      const grid = document.createElement('div');
-      grid.className = 'charts-grid';
-      container.appendChild(grid);
-      likert5.forEach((q, i) => grid.appendChild(buildCard(q, i)));
-      updateLegend('likert5');
-    }
-
-    if (yesno.length) {
-      container.innerHTML += `<div class="section-label">Preguntas Sí / No</div>`;
-      const grid = document.createElement('div');
-      grid.className = 'charts-grid';
-      container.appendChild(grid);
-      yesno.forEach((q, i) => grid.appendChild(buildCard(q, i + likert5.length)));
-      if (!likert5.length) updateLegend('yesno');
-    }
-  }
-
-  function buildCard(q, idx) {
-    const card = document.createElement('div');
-    card.className = 'chart-card';
-
-    const labels = q.data.map(d => d.label);
-    const counts = q.data.map(d => d.count);
-    const pcts   = q.data.map(d => d.pct);
-    const colors = getColors(q.type, labels);
-
-    const h3 = document.createElement('h3');
-    h3.textContent = q.question;
-    card.appendChild(h3);
-
-    const totalCount = counts.reduce((a,b) => a+b, 0);
-    const bar = document.createElement('div');
-    bar.className = 'summary-bar';
-    q.data.forEach((d, i) => {
-      const seg = document.createElement('div');
-      const w = totalCount > 0 ? (d.count / totalCount * 100) : 0;
-      seg.style.width = w + '%';
-      seg.style.background = colors.bg[i];
-      seg.title = `${d.label}: ${d.count} (${d.pct}%)`;
-      bar.appendChild(seg);
-    });
-    card.appendChild(bar);
-
-    const detailRow = document.createElement('div');
-    detailRow.className = 'detail-row';
-    q.data.forEach((d, i) => {
-      const pill = document.createElement('span');
-      pill.className = 'detail-pill';
-      pill.innerHTML = `<span class="dot" style="background:${colors.bg[i]}"></span>${d.label}: <strong>${d.count}</strong> (${d.pct}%)`;
-      detailRow.appendChild(pill);
-    });
-    card.appendChild(detailRow);
-
-    const wrap = document.createElement('div');
-    wrap.className = 'chart-wrap';
-    const canvas = document.createElement('canvas');
-    canvas.id = 'chart_' + idx;
-    wrap.appendChild(canvas);
-    card.appendChild(wrap);
-
-    requestAnimationFrame(() => {
-      const isCartesian = ['bar', 'horizontalBar'].includes(currentChartType);
-      const isRadar = currentChartType === 'radar';
-      const chartType = currentChartType === 'horizontalBar' ? 'bar' : currentChartType;
-
-      const cfg = {
-        type: chartType,
-        data: {
-          labels: labels,
-          datasets: [{
-            data: counts,
-            backgroundColor: colors.bg.map(c => c + 'cc'),
-            borderColor: colors.border,
-            borderWidth: 2,
-            borderRadius: isCartesian ? 8 : 0,
-            hoverBackgroundColor: colors.bg,
-          }]
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: true,
-          indexAxis: currentChartType === 'horizontalBar' ? 'y' : 'x',
-          layout: { padding: { top: 10, bottom: 4 } },
-          plugins: {
-            legend: { display: false },
-            tooltip: {
-              backgroundColor: '#1e293b',
-              cornerRadius: 10,
-              padding: 12,
-              callbacks: {
-                label: ctx => {
-                  const i = ctx.dataIndex;
-                  return `${labels[i]}: ${counts[i]} (${pcts[i]}%)`;
+        const cfg = {
+          type: chartType,
+          data: {
+            labels: labels,
+            datasets: [{
+              data: counts,
+              backgroundColor: colors.bg.map(c => c + 'cc'),
+              borderColor: colors.border,
+              borderWidth: 2,
+              borderRadius: isCartesian ? 8 : 0,
+              hoverBackgroundColor: colors.bg,
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            indexAxis: currentChartType === 'horizontalBar' ? 'y' : 'x',
+            layout: { padding: { top: 10, bottom: 4 } },
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                backgroundColor: '#1e293b',
+                cornerRadius: 10,
+                padding: 12,
+                callbacks: {
+                  label: ctx => {
+                    const i = ctx.dataIndex;
+                    return `${labels[i]}: ${counts[i]} (${pcts[i]}%)`;
+                  }
                 }
+              },
+              datalabels: {
+                color: isCartesian || isRadar ? '#1e293b' : '#fff',
+                font: { family: 'Inter', weight: '700', size: 12 },
+                anchor: isCartesian ? 'end' : 'center',
+                align: isCartesian ? (currentChartType === 'horizontalBar' ? 'end' : 'top') : 'center',
+                offset: isCartesian ? 4 : 0,
+                formatter: (val, ctx) => {
+                  const p = pcts[ctx.dataIndex];
+                  return val > 0 ? `${p}%` : '';
+                },
               }
             },
-            datalabels: {
-              color: isCartesian || isRadar ? '#1e293b' : '#fff',
-              font: { family: 'Inter', weight: '700', size: 12 },
-              anchor: isCartesian ? 'end' : 'center',
-              align: isCartesian ? (currentChartType === 'horizontalBar' ? 'end' : 'top') : 'center',
-              offset: isCartesian ? 4 : 0,
-              formatter: (val, ctx) => {
-                const p = pcts[ctx.dataIndex];
-                return val > 0 ? `${p}%` : '';
-              },
-            }
-          },
-          scales: isCartesian ? {
-            x: { grid: { display: false }, ticks: { color: '#64748b' } },
-            y: { grid: { color: '#f1f5f9' }, ticks: { color: '#64748b' }, beginAtZero: true }
-          } : (isRadar ? {
-            r: { beginAtZero: true, ticks: { display: false }, grid: { color: '#e2e8f0' } }
-          } : {}),
-          animation: { duration: 600 }
-        }
-      };
+            scales: isCartesian ? {
+              x: { grid: { display: false }, ticks: { color: '#64748b' } },
+              y: { grid: { color: '#f1f5f9' }, ticks: { color: '#64748b' }, beginAtZero: true }
+            } : (isRadar ? {
+              r: { beginAtZero: true, ticks: { display: false }, grid: { color: '#e2e8f0' } }
+            } : {}),
+            animation: { duration: 600 }
+          }
+        };
 
-      const chart = new window.Chart(canvas.getContext('2d'), cfg);
-      chartInstances.push(chart);
-    });
+        const chart = new window.Chart(canvas.getContext('2d'), cfg);
+        chartInstances.push(chart);
+      });
 
-    return card;
+      return card;
+    }
   }
-}
+})();
 </script>
 
 </body>
