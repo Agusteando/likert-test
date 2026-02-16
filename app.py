@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Evaluación de Calidad – Dashboard Generator (Flask + Vercel)
+Evaluación de Calidad – Dashboard (Flask for Vercel)
 
-Key Vercel fix:
-- Do NOT use the raw plantel string in the URL path (/api/data/<plantel>).
-  Unicode, spaces, and some proxies/CDNs can cause mismatches.
-- Instead, use a stable numeric plantel_id and request /api/data?id=###.
-
-This resolves: "All planteles show 0 on Vercel but work locally", while /api/data_all works.
+Fix for Vercel-only issue where per-plantel charts show 0 while global works:
+- Do NOT send the plantel name in the URL path (/api/data/<plantel>), because unicode/spaces/dashes
+  can get transformed or decoded differently behind proxies/CDNs.
+- Instead, use a stable numeric plantel_id (index in the planteles list) and request /api/data?id=###.
+- Keep /api/planteles returning a plain list of strings (as before), so the dropdown displays normally.
 """
 
 import os
@@ -25,10 +24,18 @@ _df = None
 _likert5_cols = None
 _yesno_cols = None
 _all_question_cols = None
+_plantel_names = None  # list[str] sorted, index = plantel_id
 
-# Plantel id mapping (Vercel-safe)
-_plantel_names = None            # list[str], index = plantel_id
-_plantel_name_to_id = None       # dict[str, int]
+
+def _clean_text_series(s: pd.Series) -> pd.Series:
+    return (
+        s.astype(str)
+        .str.replace("\u00A0", " ", regex=False)  # NBSP
+        .str.replace("\u2013", "–", regex=False)  # normalize en dash
+        .str.replace("\u2014", "–", regex=False)  # normalize em dash to en dash
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
 
 
 def load_data():
@@ -84,30 +91,27 @@ def load_data():
                 lambda x: (
                     "Sí" if str(x).strip().lower() in {"sí", "si"}
                     else ("No" if str(x).strip().lower() == "no" else x)
-                ) if pd.notna(x) else x
+                )
+                if pd.notna(x)
+                else x
             )
 
-    # Clean NBSP / whitespace just in case
-    def clean_series(s):
-        return (
-            s.astype(str)
-            .str.replace("\u00A0", " ", regex=False)
-            .str.replace(r"\s+", " ", regex=True)
-            .str.strip()
-        )
-
+    # Build plantel column: "Nivel Educativo – Campus"
     if "Nivel Educativo" in df.columns and "Campus" in df.columns:
-        ne = clean_series(df["Nivel Educativo"])
-        ca = clean_series(df["Campus"])
+        ne = _clean_text_series(df["Nivel Educativo"])
+        ca = _clean_text_series(df["Campus"])
         df["plantel"] = ne + " – " + ca
     else:
         df["plantel"] = "Plantel"
+
+    # Clean plantel itself (extra safety)
+    df["plantel"] = _clean_text_series(df["plantel"])
 
     return df, likert5_cols, yesno_cols
 
 
 def ensure_loaded():
-    global _df, _likert5_cols, _yesno_cols, _all_question_cols, _plantel_names, _plantel_name_to_id
+    global _df, _likert5_cols, _yesno_cols, _all_question_cols, _plantel_names
 
     if _df is not None:
         return
@@ -122,10 +126,8 @@ def ensure_loaded():
     _yesno_cols = yesno_cols
     _all_question_cols = likert5_cols + yesno_cols
 
-    # IMPORTANT: build a stable, Vercel-safe id list for planteles
     planteles = sorted(df["plantel"].dropna().unique().tolist())
     _plantel_names = planteles
-    _plantel_name_to_id = {name: i for i, name in enumerate(_plantel_names)}
 
 
 def compute_results(sub_df: pd.DataFrame):
@@ -140,7 +142,13 @@ def compute_results(sub_df: pd.DataFrame):
         data = []
         for label in order:
             c = int(counts.get(label, 0))
-            data.append({"label": label, "count": c, "pct": round(c / total * 100, 1) if total > 0 else 0})
+            data.append(
+                {
+                    "label": label,
+                    "count": c,
+                    "pct": round(c / total * 100, 1) if total > 0 else 0,
+                }
+            )
 
         results.append(
             {
@@ -156,6 +164,14 @@ def compute_results(sub_df: pd.DataFrame):
 
 # ── Flask app ───────────────────────────────────────────────────────────────
 app = Flask(__name__)
+
+
+@app.after_request
+def add_no_cache_headers(resp):
+    # Helps avoid confusing cache behavior on some deployments.
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
 @app.route("/api/health")
@@ -176,16 +192,10 @@ def api_health():
 
 @app.route("/api/planteles")
 def api_planteles():
-    """
-    Returns:
-      [
-        {"id": 0, "name": "Nivel – Campus"},
-        ...
-      ]
-    """
+    # Keep EXACTLY the old behavior: list of strings.
     try:
         ensure_loaded()
-        return jsonify([{"id": i, "name": name} for i, name in enumerate(_plantel_names)])
+        return jsonify(_plantel_names)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -194,16 +204,17 @@ def api_planteles():
 def api_data_by_id():
     """
     Vercel-safe endpoint:
-      /api/data?id=123
+      /api/data?id=###   where ### is the index in /api/planteles list
     """
     try:
         ensure_loaded()
-        plantel_id = request.args.get("id", None)
-        if plantel_id is None:
+
+        raw_id = request.args.get("id", None)
+        if raw_id is None:
             return jsonify({"error": "Missing query param ?id=PLANTEL_ID"}), 400
 
         try:
-            pid = int(plantel_id)
+            pid = int(raw_id)
         except ValueError:
             return jsonify({"error": "Invalid id (must be integer)"}), 400
 
@@ -219,7 +230,6 @@ def api_data_by_id():
 
 @app.route("/api/data_all")
 def api_data_all():
-    """Aggregated data across ALL planteles (global view)."""
     try:
         ensure_loaded()
         return jsonify(compute_results(_df))
@@ -227,12 +237,20 @@ def api_data_all():
         return jsonify({"error": str(e)}), 500
 
 
-# Keep old route for backwards compatibility (not used by the updated UI)
+# Legacy route (kept, but UI no longer uses it)
 @app.route("/api/data/<plantel>")
 def api_data_legacy(plantel):
     try:
         ensure_loaded()
-        sub = _df[_df["plantel"] == plantel]
+        # attempt to clean incoming plantel similarly (best-effort)
+        plantel_clean = (
+            str(plantel)
+            .replace("\u00A0", " ")
+            .replace("\u2013", "–")
+            .replace("\u2014", "–")
+            .strip()
+        )
+        sub = _df[_df["plantel"] == plantel_clean]
         return jsonify(compute_results(sub))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -498,19 +516,6 @@ HTML = r"""
 
 <script>
 (function () {
-  function showLoader(show) {
-    const loader = document.getElementById('loader');
-    if (!loader) return;
-    loader.classList.toggle('hidden', !show);
-  }
-
-  function showError(msg) {
-    const el = document.getElementById('clientError');
-    if (!el) return;
-    el.style.display = 'block';
-    el.textContent = msg;
-  }
-
   function loadScript(src) {
     return new Promise((resolve, reject) => {
       const s = document.createElement('script');
@@ -525,14 +530,23 @@ HTML = r"""
   async function loadFirstAvailable(sources) {
     let lastErr = null;
     for (const src of sources) {
-      try {
-        await loadScript(src);
-        return src;
-      } catch (e) {
-        lastErr = e;
-      }
+      try { await loadScript(src); return src; }
+      catch (e) { lastErr = e; }
     }
     throw lastErr || new Error('No sources provided');
+  }
+
+  function showLoader(show) {
+    const loader = document.getElementById('loader');
+    if (!loader) return;
+    loader.classList.toggle('hidden', !show);
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('clientError');
+    if (!el) return;
+    el.style.display = 'block';
+    el.textContent = msg;
   }
 
   async function boot() {
@@ -542,14 +556,12 @@ HTML = r"""
       'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js',
       'https://unpkg.com/chart.js@4.4.1/dist/chart.umd.min.js'
     ]);
-
     if (!window.Chart) throw new Error('Chart.js loaded but window.Chart is missing.');
 
     await loadFirstAvailable([
       'https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js',
       'https://unpkg.com/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js'
     ]);
-
     if (!window.ChartDataLabels) throw new Error('DataLabels loaded but window.ChartDataLabels is missing.');
 
     window.Chart.register(window.ChartDataLabels);
@@ -617,7 +629,7 @@ HTML = r"""
 
     async function startApp() {
       try {
-        // Optional quick backend check (helps diagnose Vercel data file issues)
+        // Optional health check (won't change UI, but helps catch Excel missing on Vercel)
         const health = await fetch('/api/health', { cache: 'no-store' });
         if (!health.ok) {
           const t = await health.text();
@@ -626,7 +638,6 @@ HTML = r"""
 
         const res = await fetch('/api/planteles', { cache: 'no-store' });
         const planteles = await res.json();
-
         if (!res.ok || (planteles && planteles.error)) {
           throw new Error(planteles?.error || 'Error cargando /api/planteles');
         }
@@ -634,18 +645,22 @@ HTML = r"""
         const sel = document.getElementById('selPlantel');
         sel.innerHTML = '';
 
+        // Keep the dropdown display EXACTLY like before (strings),
+        // but option.value is now a numeric id (index), which we send to /api/data?id=...
         const optAll = document.createElement('option');
         optAll.value = '__ALL__';
         optAll.textContent = '🏫 Todos los planteles';
         sel.appendChild(optAll);
 
-        // IMPORTANT: option value is the numeric id (Vercel-safe)
-        planteles.forEach(p => {
+        planteles.forEach((name, idx) => {
           const o = document.createElement('option');
-          o.value = String(p.id);
-          o.textContent = p.name;
+          o.value = String(idx);
+          o.textContent = name; // shows normal text (no [object Object])
           sel.appendChild(o);
         });
+
+        // Default to global view
+        sel.value = '__ALL__';
 
         sel.addEventListener('change', () => loadPlantel(sel.value));
 
@@ -665,7 +680,6 @@ HTML = r"""
 
         updateLegend('likert5');
 
-        // first load (defaults to __ALL__)
         await loadPlantel(sel.value);
       } catch (e) {
         console.error(e);
@@ -686,14 +700,14 @@ HTML = r"""
         let url;
         let displayName;
 
+        const sel = document.getElementById('selPlantel');
+        displayName = sel.options[sel.selectedIndex]?.textContent || 'Plantel';
+
         if (value === '__ALL__') {
           url = '/api/data_all';
           displayName = 'Todos los Planteles';
         } else {
-          // IMPORTANT: use id query param, NOT plantel name in the path
           url = `/api/data?id=${encodeURIComponent(value)}`;
-          const sel = document.getElementById('selPlantel');
-          displayName = sel.options[sel.selectedIndex]?.textContent || 'Plantel';
         }
 
         const res = await fetch(url, { cache: 'no-store' });
