@@ -10,6 +10,12 @@ Update:
 - UI: preserves everything, and adds ONE additional visualization: a 100% stacked horizontal bar chart
   (Likert distribution per plantel) with "FOCO ROJO" highlighting.
 - Fixes chart type switching robustness for per-question charts.
+
+Fixes requested:
+- Do NOT skip yes/no questions just because the column title contains "grado"; only skip the exact
+  demographic column named "Grado".
+- Comparative section: ONLY available in global view (Todos los planteles) and toggleable.
+- Yes/No: treat empty/blank-like values as missing (not counted in % denominator).
 """
 
 import os
@@ -26,7 +32,10 @@ from flask import Flask, jsonify, render_template_string, request
 # ── Config ──────────────────────────────────────────────────────────────────
 EXCEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset.xlsx")
 
-DATA_ENDPOINT_URL = os.environ.get("DATA_ENDPOINT_URL", "https://script.google.com/macros/s/AKfycbyWSeFiAu3DnCYanPMdOUuNj6YvEYw7-1VMbRJu6MmmJL1vXE7oLGFS83Tg5gmGVnulHA/exec").strip()
+DATA_ENDPOINT_URL = os.environ.get(
+    "DATA_ENDPOINT_URL",
+    "https://script.google.com/macros/s/AKfycbyWSeFiAu3DnCYanPMdOUuNj6YvEYw7-1VMbRJu6MmmJL1vXE7oLGFS83Tg5gmGVnulHA/exec",
+).strip()
 DATA_ENDPOINT_API_KEY = os.environ.get("DATA_ENDPOINT_API_KEY", "").strip()
 DATA_CACHE_TTL_SECONDS = int(os.environ.get("DATA_CACHE_TTL_SECONDS", "300"))
 
@@ -55,9 +64,22 @@ def _clean_text_series(s: pd.Series) -> pd.Series:
 
 def _normalize_df_strings(df: pd.DataFrame) -> pd.DataFrame:
     # Normalize typical “blank” strings into NaN for consistent dropna/unique behavior
+    blank_like = {"", "-", "–", "—"}
+
+    def _to_none_if_blank_like(x):
+        if isinstance(x, str):
+            t = x.replace("\u00A0", " ").strip()
+            if t.lower() in {"nan"}:
+                return None
+            if t in blank_like:
+                return None
+            if t == "":
+                return None
+        return x
+
     for c in df.columns:
         if df[c].dtype == object:
-            df[c] = df[c].apply(lambda x: None if (isinstance(x, str) and x.strip() == "") else x)
+            df[c] = df[c].apply(_to_none_if_blank_like)
     return df
 
 
@@ -145,23 +167,41 @@ def classify_and_prepare(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Lis
         "muy insatisfecho": "Muy insatisfecho",
     }
 
+    # NOTE: "grado" removed from substring skip list; we skip ONLY the exact demographic column ("Grado")
     skip_keywords = [
         "marca temporal",
         "nombre del alumno",
         "campus",
         "nivel educativo",
-        "grado",
         "¿por qué",
         "comentarios",
         "sugerencias",
     ]
+    skip_exact_cols = {"grado"}  # only skip a column actually named "Grado"
+
+    blank_like = {"", "-", "–", "—"}
+
+    def _norm_token(v: Any) -> Optional[str]:
+        if pd.isna(v):
+            return None
+        s = str(v).replace("\u00A0", " ").strip()
+        if s in blank_like:
+            return None
+        if s == "":
+            return None
+        return s.lower()
 
     question_cols: List[str] = []
     for c in df.columns:
         if c is None or str(c) == "None":
             continue
-        if any(kw in str(c).lower() for kw in skip_keywords):
+
+        col_l = str(c).replace("\u00A0", " ").strip().lower()
+        if col_l in skip_exact_cols:
             continue
+        if any(kw in col_l for kw in skip_keywords):
+            continue
+
         vals = df[c].dropna().unique()
         if len(vals) <= 10:
             question_cols.append(c)
@@ -170,25 +210,39 @@ def classify_and_prepare(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Lis
     yesno_cols: List[str] = []
 
     for c in question_cols:
-        vals = set(str(v).strip().lower() for v in df[c].dropna().unique())
+        raw = df[c].dropna().unique()
+        vals = set()
+        for v in raw:
+            t = _norm_token(v)
+            if t is None:
+                continue
+            vals.add(t)
 
-        if vals <= {"muy satisfecho", "satisfecho", "neutral", "insatisfecho", "muy insatisfecho"}:
+        if vals and vals <= {"muy satisfecho", "satisfecho", "neutral", "insatisfecho", "muy insatisfecho"}:
             likert5_cols.append(c)
-            df[c] = df[c].apply(
-                lambda x: likert_map.get(str(x).strip().lower(), x) if pd.notna(x) else x
-            )
 
-        elif vals <= {"sí", "si", "no"}:
+            def _norm_likert(x):
+                t = _norm_token(x)
+                if t is None:
+                    return None
+                return likert_map.get(t, None)
+
+            df[c] = df[c].apply(_norm_likert)
+
+        elif vals and vals <= {"sí", "si", "no"}:
             yesno_cols.append(c)
-            df[c] = df[c].apply(
-                lambda x: (
-                    "Sí"
-                    if str(x).strip().lower() in {"sí", "si"}
-                    else ("No" if str(x).strip().lower() == "no" else x)
-                )
-                if pd.notna(x)
-                else x
-            )
+
+            def _norm_yesno(x):
+                t = _norm_token(x)
+                if t is None:
+                    return None
+                if t in {"sí", "si"}:
+                    return "Sí"
+                if t == "no":
+                    return "No"
+                return None
+
+            df[c] = df[c].apply(_norm_yesno)
 
     if "Nivel Educativo" in df.columns and "Campus" in df.columns:
         ne = _clean_text_series(df["Nivel Educativo"])
@@ -247,16 +301,22 @@ def ensure_loaded(force: bool = False):
 
 
 def compute_results(sub_df: pd.DataFrame):
-    total = int(len(sub_df))
+    respondents_total = int(len(sub_df))
     results = []
 
-    if not _all_question_cols or not _likert5_cols or not _yesno_cols:
+    if not _all_question_cols:
         return []
 
+    likert_cols = _likert5_cols or []
+    yesno_cols = _yesno_cols or []
+
     for col in _all_question_cols:
-        is_likert5 = col in _likert5_cols
+        is_likert5 = col in likert_cols
         order = LIKERT5_ORDER if is_likert5 else YESNO_ORDER
-        counts = sub_df[col].value_counts() if col in sub_df.columns else pd.Series(dtype=int)
+        counts = sub_df[col].value_counts(dropna=True) if col in sub_df.columns else pd.Series(dtype=int)
+
+        # Only count recognized labels in denominator (ignores empty/missing and any unexpected tokens)
+        answered = int(sum(int(counts.get(label, 0)) for label in order))
 
         data = []
         for label in order:
@@ -265,7 +325,7 @@ def compute_results(sub_df: pd.DataFrame):
                 {
                     "label": label,
                     "count": c,
-                    "pct": round(c / total * 100, 1) if total > 0 else 0,
+                    "pct": round(c / answered * 100, 1) if answered > 0 else 0,
                 }
             )
 
@@ -273,7 +333,9 @@ def compute_results(sub_df: pd.DataFrame):
             {
                 "question": col,
                 "type": "likert5" if is_likert5 else "yesno",
-                "total": total,
+                "total": respondents_total,   # respondents (rows)
+                "answered": answered,         # non-empty recognized answers used for %
+                "missing": max(respondents_total - answered, 0),
                 "data": data,
             }
         )
@@ -787,7 +849,7 @@ HTML = r"""
   <div id="clientError" class="error-banner" style="display:none;"></div>
   <div class="stats-row" id="statsRow"></div>
 
-  <!-- NEW: single cross-plantel Likert visualization (keeps everything else intact) -->
+  <!-- Compare section (only global view + toggleable) -->
   <div id="compareContainer"></div>
 
   <div id="sectionsContainer"></div>
@@ -929,10 +991,12 @@ HTML = r"""
     // Render sequence token to avoid late chart creation when switching chart types quickly
     let renderSeq = 0;
 
-    // NEW compare chart state
+    // Compare section state (GLOBAL ONLY + TOGGLE)
     let comparePayload = null;
     let compareChart = null;
     let selectedPlantelName = null;
+    let isGlobalView = true;
+    let compareVisible = false;
 
     // Plugins for compare chart
     const focoRedPlugin = {
@@ -1015,109 +1079,25 @@ HTML = r"""
       }
     };
 
-    async function startApp() {
+    function destroyCompareChart() {
       try {
-        const health = await fetch('/api/health', { cache: 'no-store' });
-        if (!health.ok) {
-          const t = await health.text();
-          throw new Error('Backend health failed: ' + t);
+        if (compareChart) {
+          compareChart.destroy();
+          compareChart = null;
         }
-
-        const res = await fetch('/api/planteles', { cache: 'no-store' });
-        const planteles = await res.json();
-        if (!res.ok || (planteles && planteles.error)) {
-          throw new Error(planteles?.error || 'Error cargando /api/planteles');
-        }
-
-        const sel = document.getElementById('selPlantel');
-        sel.innerHTML = '';
-
-        const optAll = document.createElement('option');
-        optAll.value = '__ALL__';
-        optAll.textContent = '🏫 Todos los planteles';
-        sel.appendChild(optAll);
-
-        planteles.forEach((name, idx) => {
-          const o = document.createElement('option');
-          o.value = String(idx);
-          o.textContent = name;
-          sel.appendChild(o);
-        });
-
-        sel.value = '__ALL__';
-        sel.addEventListener('change', () => loadPlantel(sel.value));
-
-        document.querySelectorAll('#chartTypes button').forEach(btn => {
-          btn.addEventListener('click', () => {
-            document.querySelectorAll('#chartTypes button').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            currentChartType = btn.dataset.type;
-            renderCharts();
-          });
-        });
-
-        document.getElementById('selFilter').addEventListener('change', e => {
-          currentFilter = e.target.value;
-          renderCharts();
-        });
-
-        updateLegend('likert5');
-
-        // NEW: load compare payload once
-        await loadLikertCompare();
-
-        // Load initial view
-        await loadPlantel(sel.value);
       } catch (e) {
-        console.error(e);
-        showError('Error inicializando:\n' + (e?.message || String(e)));
-        showLoader(false);
+        compareChart = null;
       }
     }
 
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', startApp);
-    } else {
-      startApp();
-    }
-
-    async function loadLikertCompare() {
+    async function ensureComparePayloadLoaded() {
+      if (comparePayload) return;
       const res = await fetch('/api/likert_compare', { cache: 'no-store' });
       const payload = await res.json();
       if (!res.ok || payload?.ok === false || payload?.error) {
         throw new Error(payload?.error || 'Error cargando /api/likert_compare');
       }
       comparePayload = payload;
-      renderCompareChart(); // initial render (no selection yet)
-    }
-
-    function ensureCompareContainer() {
-      const c = document.getElementById('compareContainer');
-      if (!c) return null;
-
-      if (!comparePayload || !Array.isArray(comparePayload.planteles) || comparePayload.planteles.length === 0) {
-        c.innerHTML = '';
-        return null;
-      }
-
-      if (!document.getElementById('compareChart')) {
-        c.innerHTML = `
-          <div class="section-label">Comparativo de satisfacción por plantel (Likert)</div>
-          <div class="chart-card">
-            <h3>Distribución Likert agregada por plantel (100% apilada) · Ordenado por “foco rojo” (más negativo → menos)</h3>
-            <div class="compare-wrap">
-              <canvas id="compareChart"></canvas>
-            </div>
-            <div class="compare-note">
-              La barra de cada plantel representa el 100% de sus respuestas Likert (sumando todas las preguntas Likert).
-              Se resalta como <strong>FOCO ROJO</strong> el Top 3 por porcentaje negativo (Insatisfecho + Muy insatisfecho).
-            </div>
-            <div class="compare-badges" id="compareBadges"></div>
-          </div>
-        `;
-      }
-
-      return document.getElementById('compareChart');
     }
 
     function renderCompareBadges() {
@@ -1144,7 +1124,7 @@ HTML = r"""
         wrap.appendChild(el);
       };
 
-      // Selected
+      // Selected (in global view, usually none)
       if (selectedPlantelName) {
         makeBadge('Seleccionado', '#6366f1', selectedPlantelName);
       } else {
@@ -1161,7 +1141,7 @@ HTML = r"""
     }
 
     function renderCompareChart() {
-      const canvas = ensureCompareContainer();
+      const canvas = document.getElementById('compareChart');
       if (!canvas || !comparePayload) return;
 
       const planteles = comparePayload.planteles || [];
@@ -1173,13 +1153,11 @@ HTML = r"""
       const respondents = comparePayload.respondents || [];
       const likertAnswers = comparePayload.likert_answers || [];
 
-      // Find selected plantel index (in the compare chart order)
       let selectedIndex = -1;
       if (selectedPlantelName) {
         selectedIndex = planteles.findIndex(p => p === selectedPlantelName);
       }
 
-      // Build datasets in Likert order (green->red; heavy color)
       const datasets = order.map(label => {
         const c = LIKERT5_COLORS[label] || { bg: '#cbd5e1', border: '#94a3b8' };
         return {
@@ -1194,11 +1172,8 @@ HTML = r"""
         };
       });
 
-      // Destroy existing
-      if (compareChart) {
-        try { compareChart.destroy(); } catch (e) {}
-        compareChart = null;
-      }
+      destroyCompareChart();
+
       const existing = window.Chart.getChart(canvas);
       if (existing) existing.destroy();
 
@@ -1252,7 +1227,7 @@ HTML = r"""
                 }
               }
             },
-            datalabels: { display: false }, // keep it readable (tooltip carries detail)
+            datalabels: { display: false },
             focoRedPlugin: {
               focoFlags: focoFlags,
               negativePct: negPct,
@@ -1295,6 +1270,152 @@ HTML = r"""
       renderCompareBadges();
     }
 
+    async function renderCompareSection() {
+      const c = document.getElementById('compareContainer');
+      if (!c) return;
+
+      // MUST ONLY SHOW IN GLOBAL VIEW
+      if (!isGlobalView) {
+        compareVisible = false;
+        destroyCompareChart();
+        c.innerHTML = '';
+        return;
+      }
+
+      // Toggle UI always present in global view
+      if (!compareVisible) {
+        destroyCompareChart();
+        c.innerHTML = `
+          <div class="section-label" style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+            <span>Comparativo de satisfacción por plantel (Likert)</span>
+            <button id="btnToggleCompare" class="btn-outline" style="width:auto;padding:8px 10px;">Mostrar</button>
+          </div>
+        `;
+        const btn = document.getElementById('btnToggleCompare');
+        if (btn) {
+          btn.addEventListener('click', async () => {
+            compareVisible = true;
+            await renderCompareSection();
+          });
+        }
+        return;
+      }
+
+      // Visible: render container + load payload if needed
+      c.innerHTML = `
+        <div class="section-label" style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+          <span>Comparativo de satisfacción por plantel (Likert)</span>
+          <button id="btnToggleCompare" class="btn-outline" style="width:auto;padding:8px 10px;">Ocultar</button>
+        </div>
+        <div class="chart-card">
+          <h3>Distribución Likert agregada por plantel (100% apilada) · Ordenado por “foco rojo” (más negativo → menos)</h3>
+          <div class="compare-wrap">
+            <canvas id="compareChart"></canvas>
+          </div>
+          <div class="compare-note">
+            La barra de cada plantel representa el 100% de sus respuestas Likert (sumando todas las preguntas Likert).
+            Se resalta como <strong>FOCO ROJO</strong> el Top 3 por porcentaje negativo (Insatisfecho + Muy insatisfecho).
+          </div>
+          <div class="compare-badges" id="compareBadges"></div>
+        </div>
+      `;
+
+      const btn = document.getElementById('btnToggleCompare');
+      if (btn) {
+        btn.addEventListener('click', async () => {
+          compareVisible = false;
+          await renderCompareSection();
+        });
+      }
+
+      try {
+        await ensureComparePayloadLoaded();
+      } catch (e) {
+        console.error(e);
+        showError('Error cargando comparativo:\n' + (e?.message || String(e)));
+        compareVisible = false;
+        await renderCompareSection();
+        return;
+      }
+
+      if (!comparePayload || !Array.isArray(comparePayload.planteles) || comparePayload.planteles.length === 0) {
+        destroyCompareChart();
+        const card = c.querySelector('.chart-card');
+        if (card) {
+          card.innerHTML = `
+            <h3>Comparativo no disponible</h3>
+            <div class="compare-note">No hay datos Likert para mostrar.</div>
+          `;
+        }
+        return;
+      }
+
+      renderCompareChart();
+    }
+
+    async function startApp() {
+      try {
+        const health = await fetch('/api/health', { cache: 'no-store' });
+        if (!health.ok) {
+          const t = await health.text();
+          throw new Error('Backend health failed: ' + t);
+        }
+
+        const res = await fetch('/api/planteles', { cache: 'no-store' });
+        const planteles = await res.json();
+        if (!res.ok || (planteles && planteles.error)) {
+          throw new Error(planteles?.error || 'Error cargando /api/planteles');
+        }
+
+        const sel = document.getElementById('selPlantel');
+        sel.innerHTML = '';
+
+        const optAll = document.createElement('option');
+        optAll.value = '__ALL__';
+        optAll.textContent = '🏫 Todos los planteles';
+        sel.appendChild(optAll);
+
+        planteles.forEach((name, idx) => {
+          const o = document.createElement('option');
+          o.value = String(idx);
+          o.textContent = name;
+          sel.appendChild(o);
+        });
+
+        sel.value = '__ALL__';
+        sel.addEventListener('change', () => loadPlantel(sel.value));
+
+        document.querySelectorAll('#chartTypes button').forEach(btn => {
+          btn.addEventListener('click', () => {
+            document.querySelectorAll('#chartTypes button').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            currentChartType = btn.dataset.type;
+            renderCharts();
+          });
+        });
+
+        document.getElementById('selFilter').addEventListener('change', e => {
+          currentFilter = e.target.value;
+          renderCharts();
+        });
+
+        updateLegend('likert5');
+
+        // Initial view
+        await loadPlantel(sel.value);
+      } catch (e) {
+        console.error(e);
+        showError('Error inicializando:\n' + (e?.message || String(e)));
+        showLoader(false);
+      }
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', startApp);
+    } else {
+      startApp();
+    }
+
     async function loadPlantel(value) {
       showLoader(true);
       try {
@@ -1308,9 +1429,12 @@ HTML = r"""
           url = '/api/data_all';
           displayName = 'Todos los Planteles';
           selectedPlantelName = null;
+          isGlobalView = true;
         } else {
           url = `/api/data?id=${encodeURIComponent(value)}`;
           selectedPlantelName = displayName;
+          isGlobalView = false;
+          compareVisible = false; // reset when leaving global view
         }
 
         const res = await fetch(url, { cache: 'no-store' });
@@ -1326,8 +1450,8 @@ HTML = r"""
         const total = currentData.length > 0 ? currentData[0].total : 0;
         document.getElementById('badgeN').textContent = `${total} respuestas`;
 
-        // NEW: re-render compare chart to reflect selected highlight
-        renderCompareChart();
+        // Compare section (global only + toggleable)
+        await renderCompareSection();
 
         renderStats();
         renderCharts();
