@@ -26,7 +26,7 @@ from flask import Flask, jsonify, render_template_string, request
 # ── Config ──────────────────────────────────────────────────────────────────
 EXCEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset.xlsx")
 
-DATA_ENDPOINT_URL = os.environ.get("DATA_ENDPOINT_URL", "").strip()
+DATA_ENDPOINT_URL = os.environ.get("DATA_ENDPOINT_URL", "https://script.google.com/macros/s/AKfycbyWSeFiAu3DnCYanPMdOUuNj6YvEYw7-1VMbRJu6MmmJL1vXE7oLGFS83Tg5gmGVnulHA/exec").strip()
 DATA_ENDPOINT_API_KEY = os.environ.get("DATA_ENDPOINT_API_KEY", "").strip()
 DATA_CACHE_TTL_SECONDS = int(os.environ.get("DATA_CACHE_TTL_SECONDS", "300"))
 
